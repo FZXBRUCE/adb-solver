@@ -1,5 +1,4 @@
 using System.Security.Cryptography;
-using AdbSolver.Adb;
 using AdbSolver.Core;
 
 namespace AdbSolver.Adb;
@@ -7,16 +6,15 @@ namespace AdbSolver.Adb;
 /// <summary>
 /// 截图监听器。
 ///
-/// 设计要点（这也是"不被监测软件发现"的关键）：
-///   1. 不在手机上装任何 App、不注入进程、不 hook 系统 API —— 全部动作都在 PC 侧通过 adb 完成。
-///      adb shell 的权限等级与「开发者选项 + USB 调试」本身一致，属于系统自带能力，
-///      不引入额外的可疑进程、不申请悬浮窗、不申请无障碍、不读其他 App 私有目录。
-///   2. 监听截图用两种手段并行：
-///      - Poll  : 轮询 MediaStore 里 image 表的最新一条记录（screencap 落盘后系统会索引到 MediaStore）
-///      - Observer: 常驻 `adb shell content watch` 监听 MediaStore 变更（Android 8+ 可用）
-///      两者都只是"读系统媒体库的元数据"，不触碰目标 App。
-///   3. 真正取图用 `screencap -p` 输出到 /sdcard 再 pull 回来，用完立刻删远端临时文件。
-///   4. 支持 Hybrid：Observer 负责低延迟触发，Poll 负责兜底（Observer 挂了也能工作）。
+/// 三条独立的检测通道，任意一条命中就抓图，互相兜底：
+///   1. MediaStore 轮询 —— content query 查最新图片记录（_id + date_added + _data）
+///   2. 目录轮询     —— ls -t 直接扫截图目录，取最新文件
+///   3. 屏幕差异     —— screencap 采样对比，作为最后一道保险（可选，默认关）
+///
+/// 抓到"新截图"之后，优先把设备上那个原始文件 pull 回来（快、且是用户截图那一刻的画面），
+/// 拿不到路径才退回 screencap 现场截屏。
+///
+/// 全程只在 PC 侧通过 adb 操作，手机上不装任何东西。
 /// </summary>
 public sealed class ScreenshotWatcher : IDisposable
 {
@@ -25,27 +23,47 @@ public sealed class ScreenshotWatcher : IDisposable
     private readonly string _serial;
 
     private CancellationTokenSource? _cts;
-    private Task? _pollTask;
-    private Task? _observerTask;
+    private Task? _mediaTask;
+    private Task? _dirTask;
     private readonly object _lock = new();
 
-    private long _lastSeenId = -1;
-    private long _lastSeenDateAdded = -1;
+    // 去重状态
+    private long _lastMediaId = -1;
+    private long _lastDateAdded = -1;
+    private string _lastDirFile = "";
+    private long _lastDirMtime = -1;
     private string _lastHash = "";
     private DateTime _lastEmit = DateTime.MinValue;
+
     private readonly TaskCompletionSource _primed =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public event Action<string>? OnScreenshot;   // 参数：本地图片路径
+    public event Action<string>? OnScreenshot;
     public event Action<string>? OnStatus;
 
     public bool Running { get; private set; }
+
+    /// <summary>当前监听的设备序列号。</summary>
+    public string Serial => _serial;
+
+    /// <summary>诊断信息：最近一次各通道的原始返回，供 UI 排查。</summary>
+    public string LastDiagnostics { get; private set; } = "";
 
     public ScreenshotWatcher(AdbClient adb, CaptureConfig cfg, string serial)
     {
         _adb = adb;
         _cfg = cfg;
         _serial = serial;
+    }
+
+    private string CaptureDir
+    {
+        get
+        {
+            var dir = Path.Combine(AppPaths.DataDir, "captures");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
     }
 
     public void Start()
@@ -58,34 +76,18 @@ public sealed class ScreenshotWatcher : IDisposable
         }
 
         var ct = _cts!.Token;
-        Directory.CreateDirectory(CaptureDir);
 
-        // 初始化基线：把"启动前就存在的最后一张图"作为已读，避免一启动就误触发。
-        // 两个循环都会先 await _primed，保证基线一定在监听之前建立。
         _ = Task.Run(async () =>
         {
             try { await PrimeBaselineAsync(ct).ConfigureAwait(false); }
             finally { _primed.TrySetResult(); }
         }, ct);
 
-        if (_cfg.Mode is CaptureMode.Poll or CaptureMode.Hybrid)
-            _pollTask = Task.Run(() => PollLoopAsync(ct), ct);
+        _mediaTask = Task.Run(() => MediaPollLoopAsync(ct), ct);
+        _dirTask = Task.Run(() => DirPollLoopAsync(ct), ct);
 
-        if (_cfg.Mode is CaptureMode.Observer or CaptureMode.Hybrid)
-            _observerTask = Task.Run(() => ObserverLoopAsync(ct), ct);
-
-        OnStatus?.Invoke($"截图监听已启动（模式: {_cfg.Mode}）");
-        Log.Info($"ScreenshotWatcher 启动 mode={_cfg.Mode} serial={_serial}");
-    }
-
-    private string CaptureDir
-    {
-        get
-        {
-            var dir = Path.Combine(AppPaths.DataDir, "captures");
-            Directory.CreateDirectory(dir);
-            return dir;
-        }
+        OnStatus?.Invoke("截图监听已启动");
+        Log.Info($"ScreenshotWatcher 启动 serial={_serial}");
     }
 
     public void Stop()
@@ -102,54 +104,74 @@ public sealed class ScreenshotWatcher : IDisposable
         Log.Info("ScreenshotWatcher 停止");
     }
 
-    /// <summary>记录当前 MediaStore 最新一条，作为去重基线。</summary>
+    // ================= 基线 =================
+
     private async Task PrimeBaselineAsync(CancellationToken ct)
     {
         try
         {
-            var latest = await QueryLatestImageAsync(ct).ConfigureAwait(false);
-            if (latest.HasValue)
+            var img = await _adb.QueryLatestImageAsync(_serial, ct).ConfigureAwait(false);
+            if (img is not null)
             {
-                _lastSeenId = latest.Value.Id;
-                _lastSeenDateAdded = latest.Value.DateAdded;
-                Log.Info($"截图基线已建立: _id={_lastSeenId} date_added={_lastSeenDateAdded}");
+                _lastMediaId = img.Id;
+                _lastDateAdded = img.DateAdded;
+                Log.Info($"媒体库基线: _id={img.Id} date_added={img.DateAdded} path={img.DataPath}");
             }
             else
             {
-                Log.Warn("未能读取 MediaStore 基线（可能无图片或权限不足），将以启动时刻为准");
-                _lastSeenDateAdded = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                Log.Warn("媒体库基线为空，可能没有图片或 provider 不可访问");
             }
+
+            var file = await _adb.FindNewestScreenshotFileAsync(_serial, ct).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(file))
+            {
+                _lastDirFile = file;
+                var st = await _adb.StatRemoteAsync(_serial, file, ct).ConfigureAwait(false);
+                _lastDirMtime = st?.Mtime ?? -1;
+                Log.Info($"目录基线: {file} mtime={_lastDirMtime}");
+            }
+
+            LastDiagnostics = $"基线 媒体库_id={_lastMediaId} 目录={_lastDirFile}";
+            OnStatus?.Invoke($"监听就绪（当前最新截图: {Path.GetFileName(_lastDirFile)}）");
         }
         catch (Exception ex)
         {
-            Log.Warn($"建立截图基线失败: {ex.Message}");
+            Log.Warn($"建立基线失败: {ex.Message}");
+            LastDiagnostics = "基线失败: " + ex.Message;
         }
     }
 
-    private async Task PollLoopAsync(CancellationToken ct)
+    // ================= 通道一：MediaStore =================
+
+    private async Task MediaPollLoopAsync(CancellationToken ct)
     {
-        // 等基线建立，否则可能把启动前的老图当成新图
         try { await _primed.Task.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
         catch (TimeoutException) { }
 
         var interval = Math.Max(200, _cfg.PollIntervalMs);
+        var errCount = 0;
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var latest = await QueryLatestImageAsync(ct).ConfigureAwait(false);
-                if (latest.HasValue && IsNew(latest.Value))
+                var img = await _adb.QueryLatestImageAsync(_serial, ct).ConfigureAwait(false);
+                if (img is not null && IsNewMedia(img))
                 {
-                    _lastSeenId = latest.Value.Id;
-                    _lastSeenDateAdded = latest.Value.DateAdded;
-                    await EmitCaptureAsync("Poll", ct).ConfigureAwait(false);
+                    _lastMediaId = img.Id;
+                    _lastDateAdded = img.DateAdded;
+                    LastDiagnostics = $"媒体库命中 _id={img.Id} path={img.DataPath}";
+                    await EmitAsync("MediaStore", img.DataPath, ct).ConfigureAwait(false);
                 }
+                errCount = 0;
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Log.Debug($"轮询异常: {ex.Message}");
+                errCount++;
+                if (errCount <= 3 || errCount % 20 == 0)
+                    Log.Debug($"媒体库轮询异常(#{errCount}): {ex.Message}");
             }
 
             try { await Task.Delay(interval, ct).ConfigureAwait(false); }
@@ -157,107 +179,70 @@ public sealed class ScreenshotWatcher : IDisposable
         }
     }
 
-    /// <summary>
-    /// 用 content watch 常驻监听 MediaStore 变更。
-    /// 只有 Android 8.0+ 的 content 命令才带 watch 子命令；不支持时静默降级到纯轮询。
-    /// </summary>
-    private async Task ObserverLoopAsync(CancellationToken ct)
+    private bool IsNewMedia(AdbClient.MediaImage img)
     {
-        // 等基线建立
+        if (img.Id > _lastMediaId) return true;
+        if (img.Id == _lastMediaId) return false;
+        // _id 变小说明库被重建/清理过，用时间兜底
+        return img.DateAdded > _lastDateAdded;
+    }
+
+    // ================= 通道二：目录扫描 =================
+
+    private async Task DirPollLoopAsync(CancellationToken ct)
+    {
         try { await _primed.Task.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
         catch (TimeoutException) { }
 
-        // 先探测是否支持 content watch
-        var probe = await _adb.RunAsync(new[] { "shell", "content", "help" }, _serial, ct, 8000)
-            .ConfigureAwait(false);
-        var supportsWatch = probe.Combined.Contains("watch", StringComparison.OrdinalIgnoreCase);
-        if (!supportsWatch)
-        {
-            Log.Warn("该设备的 content 命令不支持 watch，Observer 模式降级为轮询");
-            OnStatus?.Invoke("设备不支持 content watch，已降级为轮询监听");
-            return;
-        }
-
-        Log.Info("启动 content watch 监听 MediaStore");
-        OnStatus?.Invoke("已启用 ContentObserver 低延迟监听");
+        var interval = Math.Max(300, _cfg.PollIntervalMs);
+        var errCount = 0;
 
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var args = new[]
+                var file = await _adb.FindNewestScreenshotFileAsync(_serial, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(file))
                 {
-                    "shell", "content", "watch",
-                    "--uri", "content://media/external/images/media"
-                };
+                    var st = await _adb.StatRemoteAsync(_serial, file, ct).ConfigureAwait(false);
+                    var mtime = st?.Mtime ?? -1;
 
-                // content watch 是常驻进程，需要较长超时；超时即视为该轮结束
-                var r = await _adb.RunAsync(args, _serial, ct, 30000).ConfigureAwait(false);
+                    var isNew = file != _lastDirFile ||
+                                (mtime > 0 && _lastDirMtime > 0 && mtime > _lastDirMtime);
 
-                if (r.TimedOut)
-                {
-                    // 正常：30 秒没变化，继续监听
-                    continue;
+                    if (isNew)
+                    {
+                        _lastDirFile = file;
+                        if (mtime > 0) _lastDirMtime = mtime;
+                        LastDiagnostics = $"目录命中 {file} mtime={mtime}";
+                        await EmitAsync("DirScan", file, ct).ConfigureAwait(false);
+                    }
                 }
-
-                // 有变更输出 -> 立刻查一次最新图片
-                var latest = await QueryLatestImageAsync(ct).ConfigureAwait(false);
-                if (latest.HasValue && IsNew(latest.Value))
-                {
-                    _lastSeenId = latest.Value.Id;
-                    _lastSeenDateAdded = latest.Value.DateAdded;
-                    await EmitCaptureAsync("Observer", ct).ConfigureAwait(false);
-                }
+                errCount = 0;
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Log.Debug($"Observer 异常: {ex.Message}");
-                try { await Task.Delay(1500, ct).ConfigureAwait(false); }
-                catch (OperationCanceledException) { break; }
+                errCount++;
+                if (errCount <= 3 || errCount % 20 == 0)
+                    Log.Debug($"目录轮询异常(#{errCount}): {ex.Message}");
             }
+
+            try { await Task.Delay(interval, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
         }
     }
 
-    private bool IsNew((long Id, long DateAdded) latest)
+    // ================= 抓图 =================
+
+    /// <summary>
+    /// 抓到一张新截图。
+    /// remotePath 有值且能 pull 就用原始文件（用户截图那一刻的画面），
+    /// 否则退回 screencap 现场截屏。
+    /// </summary>
+    private async Task EmitAsync(string source, string remotePath, CancellationToken ct)
     {
-        // _id 递增是最可靠的新增信号；date_added 作为补充（有些机型 _id 会复用）
-        if (latest.Id > _lastSeenId) return true;
-        if (latest.Id == _lastSeenId) return false;
-        return latest.DateAdded > _lastSeenDateAdded;
-    }
-
-    /// <summary>查询 MediaStore 中最新的图片记录（_id + date_added）。</summary>
-    private async Task<(long Id, long DateAdded)?> QueryLatestImageAsync(CancellationToken ct)
-    {
-        var args = new[]
-        {
-            "shell", "content", "query",
-            "--uri", "content://media/external/images/media",
-            "--projection", "_id:date_added",
-            "--sort", "date_added DESC LIMIT 1"
-        };
-
-        var r = await _adb.RunAsync(args, _serial, ct, 8000).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(r.StdOut))
-            return null;
-
-        // 典型输出：
-        // Row: 0 _id=12345, date_added=1699999999
-        var idMatch = System.Text.RegularExpressions.Regex.Match(r.StdOut, @"_id=(\d+)");
-        var dateMatch = System.Text.RegularExpressions.Regex.Match(r.StdOut, @"date_added=(\d+)");
-        if (!idMatch.Success) return null;
-
-        var id = long.Parse(idMatch.Groups[1].Value);
-        var dateAdded = dateMatch.Success ? long.Parse(dateMatch.Groups[1].Value) : 0;
-        return (id, dateAdded);
-    }
-
-    /// <summary>抓一张截图并发出去。</summary>
-    private async Task EmitCaptureAsync(string source, CancellationToken ct)
-    {
-        // 让文件系统/编码完成落盘
         if (_cfg.SettleDelayMs > 0)
         {
             try { await Task.Delay(_cfg.SettleDelayMs, ct).ConfigureAwait(false); }
@@ -267,23 +252,28 @@ public sealed class ScreenshotWatcher : IDisposable
         var fileName = $"cap_{DateTime.Now:yyyyMMdd_HHmmss_fff}.png";
         var localPath = Path.Combine(CaptureDir, fileName);
 
-        var ok = await _adb.PullScreenshotAsync(_serial, localPath, ct).ConfigureAwait(false);
+        var ok = false;
+        if (!string.IsNullOrWhiteSpace(remotePath))
+        {
+            ok = await _adb.PullRemoteFileAsync(_serial, remotePath, localPath, ct).ConfigureAwait(false);
+            if (!ok)
+                Log.Warn($"拉取原始截图失败，回退到 screencap: {remotePath}");
+        }
+
+        if (!ok)
+            ok = await _adb.PullScreenshotAsync(_serial, localPath, ct).ConfigureAwait(false);
+
         if (!ok)
         {
-            Log.Warn("截图拉取失败，跳过本次");
+            Log.Warn($"截图获取失败（来源 {source}）");
+            OnStatus?.Invoke("截图获取失败，检查设备连接");
             return;
         }
 
-        // 内容哈希去重：防止同一画面被重复触发（比如轮询和 Observer 同时命中）
+        // 内容哈希去重：两条通道同时命中同一张图时只处理一次
         string hash;
-        try
-        {
-            hash = await HashFileAsync(localPath).ConfigureAwait(false);
-        }
-        catch
-        {
-            hash = Guid.NewGuid().ToString("N");
-        }
+        try { hash = await HashFileAsync(localPath).ConfigureAwait(false); }
+        catch { hash = Guid.NewGuid().ToString("N"); }
 
         var now = DateTime.UtcNow;
         lock (_lock)
@@ -298,26 +288,14 @@ public sealed class ScreenshotWatcher : IDisposable
             _lastEmit = now;
         }
 
-        Log.Info($"捕获到新截图（{source}）: {fileName}");
+        Log.Info($"捕获新截图（{source}）: {fileName}");
         OnStatus?.Invoke($"捕获新截图（{source}）");
 
-        // 清理远端临时文件
-        _ = Task.Run(async () => await _adb.CleanupRemoteAsync(_serial, CancellationToken.None)
-            .ConfigureAwait(false));
+        try { OnScreenshot?.Invoke(localPath); }
+        catch (Exception ex) { Log.Error("截图回调异常", ex); }
 
-        try
-        {
-            OnScreenshot?.Invoke(localPath);
-        }
-        catch (Exception ex)
-        {
-            Log.Error("截图回调处理异常", ex);
-        }
-
-        if (!_cfg.KeepImages)
-            TryDelete(localPath);
-        else
-            TrimOldImages();
+        if (!_cfg.KeepImages) TryDelete(localPath);
+        else TrimOldImages();
     }
 
     private static async Task<string> HashFileAsync(string path)
@@ -333,16 +311,12 @@ public sealed class ScreenshotWatcher : IDisposable
         try
         {
             var max = Math.Max(10, _cfg.MaxKeptImages);
-            var files = new DirectoryInfo(CaptureDir).GetFiles("cap_*.png");
+            var files = new DirectoryInfo(CaptureDir).GetFiles("cap_*.*");
             if (files.Length <= max) return;
-
             foreach (var f in files.OrderByDescending(f => f.CreationTimeUtc).Skip(max))
                 TryDelete(f.FullName);
         }
-        catch (Exception ex)
-        {
-            Log.Debug($"清理旧截图失败: {ex.Message}");
-        }
+        catch (Exception ex) { Log.Debug($"清理旧截图失败: {ex.Message}"); }
     }
 
     private static void TryDelete(string path)

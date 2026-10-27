@@ -83,13 +83,20 @@ public sealed class SettingsForm : Form
         _cmbMode.DropDownStyle = ComboBoxStyle.DropDownList;
         _cmbMode.Items.AddRange(new object[]
         {
-            "Observer（content watch，低延迟）",
-            "Poll（定时轮询，最稳）",
-            "Hybrid（两者并行，推荐）",
+            "标准（推荐，700ms）",
+            "灵敏（350ms，更跟手）",
+            "省电（1500ms，延迟更大）",
         });
-        _cmbMode.SelectedIndex = (int)cfg.Capture.Mode;
+        // 用轮询间隔反推当前档位
+        _cmbMode.SelectedIndex = cfg.Capture.PollIntervalMs <= 400 ? 1
+            : cfg.Capture.PollIntervalMs >= 1500 ? 2 : 0;
         _cmbMode.Dock = DockStyle.Left;
-        _cmbMode.Width = 260;
+        _cmbMode.Width = 200;
+        _cmbMode.SelectedIndexChanged += (_, _) =>
+        {
+            var v = _cmbMode.SelectedIndex switch { 1 => 350, 2 => 1500, _ => 700 };
+            if ((int)_numPoll.Value != v) _numPoll.Value = v;
+        };
 
         _numPoll.Minimum = 200;
         _numPoll.Maximum = 10000;
@@ -97,6 +104,12 @@ public sealed class SettingsForm : Form
         _numPoll.Value = cfg.Capture.PollIntervalMs;
         _numPoll.Dock = DockStyle.Left;
         _numPoll.Width = 110;
+        _numPoll.ValueChanged += (_, _) =>
+        {
+            // 手动改了间隔，档位跟着联动
+            var v = (int)_numPoll.Value;
+            _cmbMode.SelectedIndex = v <= 400 ? 1 : v >= 1500 ? 2 : 0;
+        };
 
         _numSettle.Minimum = 0;
         _numSettle.Maximum = 5000;
@@ -118,14 +131,15 @@ public sealed class SettingsForm : Form
         var capInfo = new Label
         {
             Dock = DockStyle.Top,
-            Height = 100,
+            Height = 110,
             ForeColor = Color.DimGray,
             Padding = new Padding(0, 10, 0, 0),
             Text = "说明：\n" +
-                   "• Observer 用 `adb shell content watch` 监听系统媒体库变更，延迟低，但部分机型不支持。\n" +
-                   "• Poll 定时查询 MediaStore 最新一条图片记录，兼容性最好。\n" +
-                   "• Hybrid 两者同时跑，任意一个触发都会抓图，互相兜底。\n" +
-                   "• 落盘延时是截图后等待文件写完的时间，太短会拉到不完整的图。",
+                   "• 两条通道并行工作：① 查系统媒体库最新图片记录  ② 直接扫截图目录。\n" +
+                   "• 任意一条发现新截图就立刻抓图，两条同时命中会自动去重。\n" +
+                   "• 抓到后优先 pull 设备上的原始截图文件（就是你按截图键那一刻的画面）。\n" +
+                   "• 落盘延时是截图后等待文件写完的时间，太短会拉到不完整的图。\n" +
+                   "• 监听没反应时先点主界面「测试截图」确认能取到图，再看日志里的「命中」记录。",
         };
 
         pCap.Controls.Add(capInfo);
@@ -283,8 +297,13 @@ public sealed class SettingsForm : Form
         _cfg.Adb.AdbPath = _txtAdbPath.Text.Trim();
         _cfg.Adb.CommandTimeoutMs = (int)_numTimeout.Value;
 
-        _cfg.Capture.Mode = (CaptureMode)Math.Max(0, _cmbMode.SelectedIndex);
-        _cfg.Capture.PollIntervalMs = (int)_numPoll.Value;
+        _cfg.Capture.Mode = CaptureMode.Hybrid;
+        _cfg.Capture.PollIntervalMs = _cmbMode.SelectedIndex switch
+        {
+            1 => 350,
+            2 => 1500,
+            _ => 700,
+        };
         _cfg.Capture.SettleDelayMs = (int)_numSettle.Value;
         _cfg.Capture.KeepImages = _chkKeep.Checked;
 

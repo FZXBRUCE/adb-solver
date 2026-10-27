@@ -222,14 +222,46 @@ AdbSolver.exe --selftest
 <数据目录>\logs\adbsolver-YYYYMMDD.log
 ```
 
-数据目录按顺序是：
+**数据目录默认就是 EXE 旁边的 `data\`**（绿色软件，看得见、删得掉）：
+
+```
+AdbSolver.exe
+data\
+├── config.json     配置
+├── logs\           日志
+└── captures\       抓到的截图
+```
+
+只有当 EXE 所在位置不可写时（装在 `Program Files`、只读 U 盘等），才会降级到：
 
 1. `%LOCALAPPDATA%\AdbSolver`
 2. `%APPDATA%\AdbSolver`
-3. `<EXE 目录>\data`
-4. `%TEMP%\AdbSolver`
+3. `%TEMP%\AdbSolver`
+
+启动日志第一行会打印实际使用的数据目录。
 
 设置窗口里点「打开数据目录」直接跳过去。
+
+### 启动就报 Failure processing application bundle
+
+```
+Failure processing application bundle.
+Failed to create directory [C:\Users\...\Temp\.net\AdbSolver\xxxx] for extracting bundled files.
+```
+
+这是**旧版**的单文件 EXE（开了 `IncludeNativeLibrariesForSelfExtract` +
+`EnableCompressionInSingleFile`）在启动时想把自己解压到 `%TEMP%` 但没权限。
+
+目标机 TEMP 被这些机制限制时就会触发：AppLocker / WDAC、Defender ASR、
+企业组策略重定向、第三方安全软件、还原卡、精简版系统改坏的 Temp ACL。
+
+新版已经关掉自解压，托管库和原生库直接从 EXE 映像映射，**不再碰 TEMP**。
+换新版即可。
+
+如果换成新版后仍报
+`UnauthorizedAccessException: Access to the path '...\Temp\xxxx.tmp' is denied`，
+那是 `Application.EnableVisualStyles()` 要写 activation context 清单 ——
+新版本已把它包在 try/catch 里，视觉样式要不到也照常启动。
 
 ### adb 找不到
 

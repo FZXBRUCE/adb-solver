@@ -69,10 +69,13 @@ public sealed class AdbConfig
 
 public sealed class CaptureConfig
 {
-    /// <summary>监听方式：Observer=ContentObserver 文件系统监听（快、但需要 shell 常驻）, Poll=定时轮询 MediaStore。</summary>
+    /// <summary>
+    /// 监听方式。现在两条通道（MediaStore 查询 / 目录扫描）始终并行跑，
+    /// 这个字段只用于兼容旧配置和日志显示，不再决定行为。
+    /// </summary>
     public CaptureMode Mode { get; set; } = CaptureMode.Hybrid;
 
-    /// <summary>轮询间隔（毫秒）。Hybrid 模式下作为兜底频率。</summary>
+    /// <summary>轮询间隔（毫秒）。越小越灵敏，越大越省电。</summary>
     public int PollIntervalMs { get; set; } = 700;
 
     /// <summary>去重时间窗（毫秒）。同一张图在这段时间内不重复处理。</summary>
@@ -220,8 +223,10 @@ public static class AppPaths
     private static readonly object _lock = new();
 
     /// <summary>
-    /// 数据目录。按 LocalAppData → 漫游 AppData → EXE 同目录 → TEMP 的顺序降级，
-    /// 任何一个位置不可写都不会让程序崩掉。这是"换台电脑不闪退"的关键之一。
+    /// 数据目录。优先放在 EXE 同目录下的 data\ —— 绿色软件，看得见、拷走就带走、删了就是清空。
+    /// 只有当 EXE 所在位置不可写（比如装在 Program Files、或 U 盘只读）时，
+    /// 才降级到 LocalAppData → 漫游 AppData → TEMP。
+    /// 每个候选位置都会真写一个探针文件验证，避免"目录存在但只读"踩坑。
     /// </summary>
     public static string DataDir
     {
@@ -233,6 +238,11 @@ public static class AppPaths
                 if (_dataDir is not null) return _dataDir;
 
                 var candidates = new List<string>();
+
+                // 1) 首选：EXE 根目录\data
+                try { candidates.Add(Path.Combine(AppDir, "data")); } catch { }
+
+                // 2) 降级：用户目录
                 void Add(Environment.SpecialFolder f)
                 {
                     try
@@ -246,7 +256,8 @@ public static class AppPaths
 
                 Add(Environment.SpecialFolder.LocalApplicationData);
                 Add(Environment.SpecialFolder.ApplicationData);
-                try { candidates.Add(Path.Combine(AppDir, "data")); } catch { }
+
+                // 3) 最后兜底：TEMP
                 try { candidates.Add(Path.Combine(Path.GetTempPath(), "AdbSolver")); } catch { }
 
                 foreach (var c in candidates)
@@ -287,6 +298,30 @@ public static class AppPaths
                 _logDir = DataDir;
             }
             return _logDir;
+        }
+    }
+
+    /// <summary>
+    /// 给 adb 子进程用的临时目录。
+    /// adb server 启动时会往 %TEMP%\adb.log 写日志，系统 TEMP 被锁时它会直接
+    /// 报 "cannot open '...\Temp\adb.log': Permission denied" 然后起不来，
+    /// 表现就是"设备列表空的 / 连不上手机"。
+    /// 这里给它一个我们自己保证可写的目录。
+    /// </summary>
+    public static string TempDir
+    {
+        get
+        {
+            try
+            {
+                var dir = Path.Combine(DataDir, "tmp");
+                Directory.CreateDirectory(dir);
+                return dir;
+            }
+            catch
+            {
+                return DataDir;
+            }
         }
     }
 

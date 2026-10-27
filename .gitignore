@@ -2,9 +2,18 @@
 bin/
 obj/
 dist/
+out/
+publish/
 *.user
 *.suo
 .vs/
+
+# 本地构建用的临时/缓存目录（构建脚本会在这几个目录里折腾，不进仓库）
+.buildtmp/
+.dotnethome/
+_finaltest*/
+stage/
+*.zip
 
 # 运行数据（含 API Key，绝对不能提交）
 data/

@@ -27,6 +27,12 @@ jobs:
       - name: Build
         run: dotnet build src/AdbSolver/AdbSolver.csproj -c Release --no-restore
 
+      # 关键：不开 IncludeNativeLibrariesForSelfExtract / EnableCompressionInSingleFile。
+      # 开了这两个，EXE 启动时必须先解压到 %TEMP%\.net\... 才能跑；
+      # 目标机 TEMP 一旦被 AppLocker / ASR / 组策略 / 安全软件限制，就报
+      #   Failure processing application bundle.
+      #   Failed to create directory [...] for extracting bundled files.
+      # 连窗口都不弹 —— 这就是"换台电脑就闪退"的根因。
       - name: Publish single-file EXE
         run: >
           dotnet publish src/AdbSolver/AdbSolver.csproj
@@ -34,27 +40,39 @@ jobs:
           -r win-x64
           --self-contained true
           -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:EnableCompressionInSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=false
+          -p:EnableCompressionInSingleFile=false
           -p:DebugType=none
-          -o dist/win-x64
+          -o publish
 
       - name: Self-test
         shell: pwsh
         run: |
-          $exe = "dist/win-x64/AdbSolver.exe"
+          $exe = "publish/AdbSolver.exe"
           if (-not (Test-Path $exe)) { throw "EXE not produced" }
           $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "AdbSolver.exe = $size MB"
-          # --selftest 不弹窗，只打印并写文件，退出码 0
+
+          # 目录里只留 EXE，验证它是真正的独立单文件（不依赖旁边的原生 DLL）
+          Get-ChildItem publish -Filter *.dll | Remove-Item -Force
+          $left = (Get-ChildItem publish -File).Count
+          if ($left -ne 1) { throw "publish dir should contain exactly 1 file, found $left" }
+          Write-Host "single-file check OK"
+
+          # --selftest 不弹窗，只打印并写文件
           $p = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru -Wait -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "selftest failed with exit $($p.ExitCode)" }
+
+          # 数据目录必须落在 EXE 旁边
+          $data = Join-Path (Split-Path $exe) "data"
+          if (-not (Test-Path $data)) { throw "data dir not created next to EXE" }
+          Write-Host "portable data dir OK: $data"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AdbSolver-win-x64
-          path: dist/win-x64/AdbSolver.exe
+          path: publish/AdbSolver.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -62,5 +80,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/win-x64/AdbSolver.exe
+          files: publish/AdbSolver.exe
           generate_release_notes: true

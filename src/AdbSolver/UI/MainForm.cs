@@ -481,6 +481,20 @@ public sealed class MainForm : Form
         if (item.Info.State == "none") return;
         _cfg.Adb.DeviceSerial = item.Info.Serial;
         _ = LoadDeviceDetailAsync();
+
+        // 运行中切了设备：监听器还盯着老设备，必须重建，否则新设备截图永远收不到
+        if (_running && _watcher is not null && item.Info.Serial != _watcher.Serial)
+        {
+            Log.Info($"运行中切换设备 → {item.Info.Serial}，重启监听");
+            _watcher.OnScreenshot -= OnNewScreenshot;
+            _watcher.Stop();
+            _watcher.Dispose();
+
+            _watcher = new ScreenshotWatcher(_adb!, _cfg.Capture, item.Info.Serial);
+            _watcher.OnScreenshot += OnNewScreenshot;
+            _watcher.OnStatus += s => Ui(() => SetStatus(s));
+            _watcher.Start();
+        }
     }
 
     private async void OnWifiConnect()
@@ -534,14 +548,6 @@ public sealed class MainForm : Form
     {
         if (_adb is null) return;
 
-        if (_ai is null || _ai.AvailableCount == 0)
-        {
-            MessageBox.Show("还没有可用的 AI 端点。\n请先到「设置 → AI 端点」里填好 BaseUrl / ApiKey / Model。",
-                "缺少 AI 配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            OnSettings();
-            if (_ai is null || _ai.AvailableCount == 0) return;
-        }
-
         var dev = _currentDevice;
         if (dev is null || !dev.IsReady)
         {
@@ -549,6 +555,11 @@ public sealed class MainForm : Form
                 "设备未就绪", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+
+        // 监听和答题是两件事，别互相绑死。
+        // 没配 AI 也要先把截图监听跑起来——至少让用户看见"图抓到了"，
+        // 而不是点了开始弹个框，其实什么都没在听。
+        var aiReady = _ai is not null && _ai.AvailableCount > 0;
 
         _pipelineCts?.Cancel();
         _pipelineCts?.Dispose();
@@ -564,8 +575,17 @@ public sealed class MainForm : Form
         _running = true;
         _btnToggle.Text = "■ 停止";
         _btnToggle.BackColor = Color.FromArgb(200, 60, 60);
-        SetStatus($"运行中 — 监听 {dev.Model} 的截图");
-        Log.Info("=== 自动答题已启动 ===");
+
+        if (aiReady)
+        {
+            SetStatus($"运行中 — 监听 {dev.Model} 的截图");
+            Log.Info("=== 自动答题已启动 ===");
+        }
+        else
+        {
+            SetStatus($"只监听中 — 已开始抓图，但没配 AI，不会自动答题");
+            Log.Warn("=== 已启动截图监听，但 AI 端点为空，仅抓图不答题 ===");
+        }
     }
 
     private void StopRun()
@@ -618,6 +638,19 @@ public sealed class MainForm : Form
     private async Task ProcessOneAsync(string path, CancellationToken ct)
     {
         if (_pipeline is null) return;
+
+        // 没配 AI 就别往下走，但要让用户明确知道"图确实抓到了"，
+        // 而不是看见"跳过"就以为是监听坏了。
+        if (_ai is null || _ai.AvailableCount == 0)
+        {
+            Ui(() =>
+            {
+                SetStatus($"已抓到截图（{Path.GetFileName(path)}），但没配 AI，不答题");
+                _lstHistory.Items.Insert(0, $"{DateTime.Now:HH:mm:ss}  抓到截图（未配 AI）");
+                while (_lstHistory.Items.Count > 300) _lstHistory.Items.RemoveAt(_lstHistory.Items.Count - 1);
+            });
+            return;
+        }
 
         Ui(() => SetStatus("识别中…"));
         var outcome = await _pipeline.ProcessAsync(path, ct).ConfigureAwait(false);

@@ -175,7 +175,29 @@ public sealed class EndpointEditorForm : Form
         AcceptButton = btnOk;
         CancelButton = btnCancel;
 
-        if (_list.Count > 0) _grid.Rows[0].Selected = true;
+        // 坑：DataGridView 设了 DataSource 之后，行不是立刻生成的，
+        // 要等控件句柄建好、绑定跑完才有 Rows。
+        // 在构造函数里写 _grid.Rows[0].Selected = true 必然抛
+        //   ArgumentOutOfRangeException: Index was out of range（Parameter 'index'）
+        // 所以首行选中推迟到 Shown 之后，并且带数量检查。
+        Shown += (_, _) => SelectFirstRowIfAny();
+    }
+
+    /// <summary>安全地选中第一行：行还没生成就延后一拍再试。</summary>
+    private void SelectFirstRowIfAny()
+    {
+        if (_grid.Rows.Count > 0)
+        {
+            _grid.Rows[0].Selected = true;
+            return;
+        }
+
+        // 绑定还没落地，往消息队列尾巴上挂一次重试，此时行已生成
+        if (IsHandleCreated)
+            BeginInvoke(new Action(() =>
+            {
+                if (_grid.Rows.Count > 0) _grid.Rows[0].Selected = true;
+            }));
     }
 
     public List<AiEndpointConfig> Result => _list.ToList();
@@ -188,7 +210,14 @@ public sealed class EndpointEditorForm : Form
         var ep = Selected;
         if (ep is null) return;
         _txtName.Text = ep.Name;
-        _cmbKind.SelectedIndex = (int)ep.Kind;
+
+        // 配置里存的 Kind 可能是脏值（手改 json、旧版本枚举错位），
+        // 直接 (int) 转过去再赋给 SelectedIndex 会抛 ArgumentOutOfRangeException。
+        // 这里夹到合法范围。
+        var kindIdx = (int)ep.Kind;
+        if (kindIdx < 0 || kindIdx >= _cmbKind.Items.Count) kindIdx = 0;
+        _cmbKind.SelectedIndex = kindIdx;
+
         _txtBaseUrl.Text = ep.BaseUrl;
         _txtApiKey.Text = ep.ApiKey;
         _txtModel.Text = ep.Model;
@@ -211,7 +240,11 @@ public sealed class EndpointEditorForm : Form
             Enabled = true,
         };
         _list.Add(ep);
-        _grid.Rows[_grid.Rows.Count - 1].Selected = true;
+
+        // 同样别在行还没生成时碰 Rows，走统一的安全选中
+        SelectFirstRowIfAny();
+        var last = _grid.Rows.Count - 1;
+        if (last >= 0) _grid.Rows[last].Selected = true;
     }
 
     private void OnDelete()

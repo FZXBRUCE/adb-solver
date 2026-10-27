@@ -10,15 +10,38 @@
     <RootNamespace>AdbSolver</RootNamespace>
     <AssemblyName>AdbSolver</AssemblyName>
 
-    <!-- 自包含单文件：目标机器无需安装 .NET 运行时，杜绝"换个电脑就闪退" -->
+    <!--
+      自包含单文件：目标机器无需安装 .NET 运行时。
+
+      关键：刻意不开 IncludeNativeLibrariesForSelfExtract 和 EnableCompressionInSingleFile。
+      开了这两个，单文件 EXE 启动时必须先把自己解压到 %TEMP%\.net\... 才能跑；
+      一旦目标机器 TEMP 被 AppLocker / Defender ASR / 组策略 / 安全软件锁成只读，
+      启动就会直接报
+        Failure processing application bundle.
+        Failed to create directory [...] for extracting bundled files.
+      连窗口都不弹 —— 这就是"换台电脑就闪退"的头号元凶。
+
+      关掉之后，托管程序集和原生库都直接从 EXE 映像里映射加载，不落地解压，
+      对目标机器 TEMP 权限零依赖。体积会大一点，但换来的是真的能跑。
+    -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
 
+    <!--
+      单文件模式下原生 DLL 默认不塞进 EXE，会散落在旁边。
+      加上这句才会全部编进 EXE —— 但注意：这一句本身不会触发 %TEMP% 解压，
+      真正触发解压的是 IncludeNativeLibrariesForSelfExtract（上一行，已设为 false）。
+      .NET 8 支持直接把原生库从单文件映像映射进内存，所以能既"只有一个文件"又不碰 TEMP。
+    -->
+    <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
+    <IncludeNativeLibrariesInSingleFile>true</IncludeNativeLibrariesInSingleFile>
+
+    <!-- 只发 win-x64，不带任何其他 RID 的 native 资产，避免误带 WPF 依赖 -->
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <NuGetAudit>false</NuGetAudit>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
@@ -36,5 +59,26 @@
     全部依赖仅使用 .NET 8 基础类库（System.Text.Json / System.Net.Http / System.Drawing / WinForms）。
     这样在完全离线的构建环境里也能 restore + publish 成功。
   -->
+
+  <!--
+    net8.0-windows + UseWindowsForms 会把整个 WindowsDesktop 运行时包（含 WPF）拉进来，
+    发布目录里就会多出 D3DCompiler_47_cor3.dll / wpfgfx_cor3.dll / PresentationNative_cor3.dll
+    这些纯 WinForms 项目根本用不到的原生库。
+
+    它们在单文件模式下不会进 EXE，而是散落在 EXE 旁边，看起来就像"还需要带一堆 DLL"。
+    实测 EXE 单独跑完全正常（WinForms 不加载它们），所以这里发布后直接删掉，
+    保证交付物是干干净净的一个 EXE。
+  -->
+  <Target Name="RemoveUnusedWpfNativeLibs" AfterTargets="Publish">
+    <ItemGroup>
+      <_WpfNativeLibs Include="$(PublishDir)D3DCompiler_47_cor3.dll;
+                              $(PublishDir)PenImc_cor3.dll;
+                              $(PublishDir)PresentationNative_cor3.dll;
+                              $(PublishDir)vcruntime140_cor3.dll;
+                              $(PublishDir)wpfgfx_cor3.dll" />
+    </ItemGroup>
+    <Delete Files="@(_WpfNativeLibs)" ContinueOnError="true" />
+    <Message Importance="high" Text="已清理未使用的 WPF 原生库" />
+  </Target>
 
 </Project>

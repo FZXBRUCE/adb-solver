@@ -26,9 +26,11 @@
 | 特性 | 说明 |
 | --- | --- |
 | **零依赖单文件** | `AdbSolver.exe` 自带 .NET 运行时，目标机不需要装任何东西 |
-| **不闪退** | 数据目录多级降级（LocalAppData → Roaming → EXE 同目录 → TEMP），任何路径不可写都不崩 |
+| **不闪退** | 单文件**不解压到 TEMP**（托管库和原生库直接从 EXE 映像映射），对目标机 TEMP 权限零依赖 |
+| **绿色便携** | 数据就放 EXE 旁边的 `data\` 目录，看得见、拷走就带走、删了就是清空 |
 | **全局异常兜底** | 未捕获异常写日志 + 弹窗提示，而不是静默退出 |
-| **三种截图监听** | Observer（低延迟）/ Poll（最稳）/ Hybrid（双保险） |
+| **双通道截图监听** | MediaStore 查询 + 目录扫描，两条独立通道互相兜底 |
+| **监听与答题解耦** | 没配 AI 也能正常监听抓图，不会因为缺配置就假装在工作 |
 | **多 AI 端点** | OpenAI 兼容、Claude、Gemini 三种协议，支持故障转移 |
 | **角色分工** | 可以指定 A 端点专门识图、B 端点专门作答 |
 | **两段式答题** | 先检索再作答，正确率更高 |
@@ -102,23 +104,40 @@ API Key : sk-xxxxxxxx
 
 ## 截图监听原理
 
-程序提供三种模式：
+程序内部跑两条**互相独立、互相兜底**的检测通道，任意一条命中就抓图：
 
-**Observer 模式**
-用 `adb shell content watch --uri content://media/external/images/media` 监听媒体库变更事件，延迟最低。缺点是部分定制 ROM（MIUI、ColorOS 等）会限制该命令。
+**通道一：MediaStore 轮询**
+```
+adb shell content query --uri content://media/external/images/media \
+  --projection _id:date_added:_data --sort 'date_added DESC'
+```
+拿最新一条图片记录的 `_id` 和 `date_added`，变了就是新图。
+注意：`--sort` 只接受排序表达式，**不能塞 LIMIT**，否则设备端直接抛
+`IllegalArgumentException: Invalid token LIMIT`；而且整条 shell 命令必须拼成
+一个字符串传给 adb，拆成多个参数会被 adb 当成独立参数转发，设备端只收到
+一个没有值的 `--sort`，直接打 usage 退出。
 
-**Poll 模式**
-定时查询 MediaStore 里最新一条图片记录，发现 `date_added` 变化就抓图。兼容性最好，任何机型都能用。
-
-**Hybrid 模式（默认推荐）**
-两个同时跑，谁先触发算谁的。Observer 快、Poll 兜底，实际体验最好。
+**通道二：目录扫描**
+```
+adb shell ls -t /sdcard/Pictures/Screenshots | head -20
+```
+再 `stat -c '%Y %s'` 比对 mtime。MediaStore 没索引、provider 被 ROM 限制、
+或者刚截图还没入库的时候，这条通道兜住。实测在 vivo / ColorOS 这类机器上，
+**目录扫描往往比 MediaStore 先命中**。
 
 抓到图之后流程是：
 
 ```
-检测到新图 → 等文件落盘（可配置延时）→ adb exec-out screencap 拉原图
+检测到新图 → 等文件落盘（可配置延时）→ 优先 pull 设备上的原始截图文件
+→ 拿不到路径才回退 adb exec-out screencap 现场截屏
+→ SHA256 内容去重（两条通道同时命中同一张只处理一次）
 → 转 base64 → 发给 OCR 端点 → 拿到题干 → 检索 → 作答 → 显示 + 复制
 ```
+
+> **重要**：截图监听和 AI 答题是解耦的。
+> 就算一个 AI 端点都没配，点「开始」也会正常监听并抓图，状态栏和日志会显示
+> "已抓到截图（未配 AI）"。以前这两个是绑死的，没配 AI 点开始直接弹框，
+> 监听器根本没启动——你会以为监听坏了，其实它压根没在跑。
 
 ---
 
@@ -130,7 +149,7 @@ adb-solver/
 │   ├── Adb/
 │   │   ├── AdbClient.cs          ADB 命令封装（设备枚举/WiFi/截图）
 │   │   ├── DeviceInfo.cs         设备信息模型
-│   │   └── ScreenshotWatcher.cs  截图监听（Observer/Poll/Hybrid）
+│   │   └── ScreenshotWatcher.cs  截图监听（MediaStore + 目录扫描双通道）
 │   ├── Ai/
 │   │   └── AiClient.cs           三种协议统一封装 + 故障转移
 │   ├── Core/
@@ -164,16 +183,60 @@ cd adb-solver/src/AdbSolver
 # 调试运行
 dotnet run
 
-# 打包单文件 EXE（自包含，约 63MB）
+# 打包单文件 EXE（自包含，约 130MB）
 dotnet publish -c Release -r win-x64 --self-contained true \
   -p:PublishSingleFile=true \
-  -p:IncludeNativeLibrariesForSelfExtract=true \
-  -p:EnableCompressionInSingleFile=true \
+  -p:IncludeNativeLibrariesForSelfExtract=false \
+  -p:EnableCompressionInSingleFile=false \
   -p:DebugType=none \
-  -o ../../dist/win-x64
+  -o ../../publish
 ```
 
-产物：`dist/win-x64/AdbSolver.exe`，双击即用。
+产物：`publish/AdbSolver.exe`，**就这一个文件**，双击即用。
+
+> ### 为什么不能开 `IncludeNativeLibrariesForSelfExtract` / `EnableCompressionInSingleFile`
+>
+> 这两个开关会让单文件 EXE 在启动时**先把自己解压到 `%TEMP%\.net\<AppName>\<hash>\`**
+> 才能跑起来。一旦目标机器的 TEMP 目录被以下任一机制限制，程序会直接崩在启动阶段，
+> **连窗口都不弹**，只会弹一个：
+>
+> ```
+> Failure processing application bundle.
+> Failed to create directory [C:\Users\...\Temp\.net\AdbSolver\xxxx] for extracting bundled files.
+> ```
+>
+> 常见的限制来源：
+>
+> - AppLocker / WDAC 软件限制策略把 `%TEMP%` 设为不可执行或不可写
+> - Defender ASR 规则「阻止从 PSExec 和 WMI 创建的进程」「阻止 Office 创建子进程」的连带限制
+> - 企业组策略把 `%TEMP%` 重定向到无写权限的网络路径
+> - 第三方安全软件 / 沙箱 / 还原卡锁死 `%TEMP%`
+> - 精简版系统把 `Temp` 目录的 ACL 改坏了
+>
+> 这就是「**自己电脑上好好的，拷到别人电脑双击就闪退**」的头号元凶。
+> 关掉这两个开关后，托管程序集和原生库都直接从 EXE 映像里映射加载，
+> **完全不落地解压**，对 TEMP 权限零依赖。代价是体积从 63MB 涨到 130MB，
+> 换来的是真的到哪都能跑。
+>
+> 另外 `Application.EnableVisualStyles()` 内部也会往 `%TEMP%` 写一个
+> activation context 清单文件，同样会因 TEMP 不可写而抛
+> `UnauthorizedAccessException: Access to the path 'C:\...\Temp\xxxx.tmp' is denied`。
+> `Program.cs` 里已经把它包在 try/catch 里 —— 视觉样式要不到就算了，绝不能挡住启动。
+>
+> ### 还有一个坑：adb server 也依赖 `%TEMP%`
+>
+> 程序自己不掉 TEMP 了，但它拉起来的 `adb.exe` 还在用系统 TEMP：
+>
+> ```
+> error: cannot open 'C:\Users\xxx\AppData\Local\Temp\adb.log': Permission denied
+> * failed to start daemon
+> error: cannot connect to daemon
+> ```
+>
+> adb server 起不来，**设备列表就永远是空的**，看起来像"连不上手机"。
+>
+> 现在 `AdbClient` 给所有 adb 子进程注入了 `TEMP` / `TMP` 环境变量，
+> 指向 `<数据目录>\tmp`（保证可写），这个坑也一并堵上了。
 
 ### 自检模式
 
@@ -185,16 +248,37 @@ AdbSolver.exe --selftest
 
 结果同时打印到控制台并写入 `data/selftest.txt`。
 
+### 诊断模式（截图抓不到时用这个）
+
+```bash
+AdbSolver.exe --probe
+```
+
+不启动界面，把截图检测链路的每一步原始返回全打出来：adb 路径、设备列表、
+MediaStore 查询结果、目录扫描结果、pull 测试、以及 25 秒实时监听窗口。
+这 25 秒内你在手机上截一张图，正常的话会立刻打出 `★ 命中: <本地路径>`。
+
+结果同时写入 `data/probe.txt`，方便贴给别人看。
+
 ---
 
 ## 配置文件
 
-位置优先级（第一个可写的胜出）：
+**绿色软件，数据就在 EXE 旁边的 `data\` 目录里：**
 
-1. `%LOCALAPPDATA%\AdbSolver\config.json`
-2. `%APPDATA%\AdbSolver\config.json`
-3. `<EXE 目录>\data\config.json`
-4. `%TEMP%\AdbSolver\config.json`
+```
+AdbSolver.exe
+data/
+├── config.json          配置（含 API Key）
+├── logs/                运行日志
+└── captures/            抓到的截图（keepImages 打开时才留）
+```
+
+想清空重来？直接把 `data` 目录删了。想整个搬走？EXE + `data` 一起拷走就行。
+
+只有当 EXE 所在位置**不可写**时（装在 `Program Files`、只读 U 盘、光盘），
+才会自动降级到 `%LOCALAPPDATA%\AdbSolver` → `%APPDATA%\AdbSolver` → `%TEMP%\AdbSolver`。
+启动日志第一行会打印实际用的数据目录，一看就知道。
 
 格式：
 
@@ -242,11 +326,22 @@ AdbSolver.exe --selftest
 
 **Q: 双击没反应 / 一闪而过**
 
-跑 `AdbSolver.exe --selftest`，看控制台输出和 `data/logs/` 下的日志。绝大多数情况是 adb 没找到，或者数据目录不可写（已做多级降级，理论上不该发生）。
+跑 `AdbSolver.exe --selftest`，看控制台输出和 `data\logs\` 下的日志。
+
+如果连 `--selftest` 都报这个：
+
+```
+Failure processing application bundle.
+Failed to create directory [...] for extracting bundled files.
+```
+
+说明你拿的是**旧版**（开了自解压的）。换成现在这个不开自解压的版本，就不会再出现。
+如果还报 `Access to the path '...\Temp\xxxx.tmp' is denied`，那是 `EnableVisualStyles`
+被 TEMP 权限挡了 —— 新版本已包了 try/catch，不会再崩。
 
 **Q: 杀毒软件报毒**
 
-单文件自解压 EXE 容易误报。要么加白名单，要么用框架依赖版本自己编译。源码全在这里，可以自己审。
+单文件自包含 EXE 容易误报。要么加白名单，要么用框架依赖版本自己编译。源码全在这里，可以自己审。
 
 **Q: 手机连上了但显示"未授权"**
 
@@ -254,7 +349,28 @@ AdbSolver.exe --selftest
 
 **Q: 截图监听不触发**
 
-换成 Poll 模式试试。部分 ROM 的 `content watch` 被阉割了。
+按顺序排查，别瞎猜：
+
+1. **先确认它到底在不在听**。点「开始」之后状态栏应该出现
+   `截图监听已启动` → `监听就绪（当前最新截图: xxx.jpg）`。
+   如果没有这两行，说明监听器压根没启动。
+2. 跑诊断模式，它会把每一步的原始返回全打出来：
+   ```
+   AdbSolver.exe --probe
+   ```
+   输出里 `[1] 媒体库` / `[2] 目录扫描` 应该都能拿到文件路径；
+   `[4] 实时监听 25 秒` 期间你在手机上截一张图，应该出现 `★ 命中: ...`。
+3. 看日志 `data/logs/adbsolver-*.log`，搜索 `基线` 和 `命中`。
+4. 截图目录不在默认位置的机型（部分 ROM 存到
+   `/sdcard/DCIM/Screenshots` 或 `/sdcard/Pictures` 根下），
+   程序会把这几个目录都扫一遍，不用手动配。
+5. 如果 `[1]` 空但 `[2]` 有结果——正常，说明 MediaStore 没索引，
+   目录扫描在兜底，功能不受影响。
+
+**Q: 抓到的图是旧的**
+
+`轮询间隔` 调小一点（默认 700ms，可以到 200ms）。
+另外 `落盘延时` 别设太大，截图刚生成时文件可能还没写完。
 
 **Q: OCR 出来是乱码**
 
