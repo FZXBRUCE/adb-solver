@@ -23,7 +23,11 @@ public sealed class SettingsForm : Form
 
     public SettingsForm(AppConfig cfg, AdbClient? adb)
     {
-        _cfg = cfg;
+        // 拿副本改。原来直接把主窗口的配置对象丢进来就地修改，
+        // 用户点「取消」甚至按 X 关掉时，改动已经落到那个对象上了，
+        // 只是没写盘——下次任何一次保存就会把取消掉的改动一起带出去。
+        // 现在改成：点「保存」才 CopyFrom 回去，取消就什么都不留。
+        _cfg = cfg.Clone();
 
         Text = "设置";
         Width = 720;
@@ -151,7 +155,7 @@ public sealed class SettingsForm : Form
 
         _lblEndpointCount.Dock = DockStyle.Top;
         _lblEndpointCount.Height = 34;
-        _lblEndpointCount.Text = $"已配置 {cfg.Endpoints.Count} 个端点，启用 {cfg.Endpoints.Count(e => e.Enabled)} 个";
+        _lblEndpointCount.Text = $"已配置 {_cfg.Endpoints.Count} 个端点，启用 {_cfg.Endpoints.Count(e => e.Enabled)} 个";
 
         var btnEdit = new Button
         {
@@ -165,7 +169,7 @@ public sealed class SettingsForm : Form
         btnEdit.FlatAppearance.BorderSize = 0;
         btnEdit.Click += (_, _) =>
         {
-            using var dlg = new EndpointEditorForm(cfg.Endpoints);
+            using var dlg = new EndpointEditorForm(_cfg.Endpoints);
             dlg.ShowDialog(this);
             _cfg.Endpoints = dlg.Result;
             _lblEndpointCount.Text =
@@ -291,6 +295,9 @@ public sealed class SettingsForm : Form
         ctrl.Dock = DockStyle.Fill;
         t.Controls.Add(ctrl);
     }
+
+    /// <summary>点「保存」后由调用方取走，写回主配置。</summary>
+    public AppConfig Result => _cfg;
 
     private void ApplyToConfig()
     {

@@ -370,6 +370,12 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        // 关窗口必须落盘。
+        // 之前这里只清理资源不保存，导致「设置」对话框用 X 关掉时（DialogResult=Cancel，
+        // 主窗口那条 _cfg.Save() 根本不会执行）所有改动全丢，下次启动又是默认配置——
+        // 用户看到的就是"一关软件配置全没了"。
+        try { _cfg.Save(); } catch { }
+
         try
         {
             StopRun();
@@ -727,10 +733,17 @@ public sealed class MainForm : Form
         using var dlg = new SettingsForm(_cfg, _adb);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
+        // 对话框里改的是一份副本，点「保存」才拷回来
+        _cfg.CopyFrom(dlg.Result);
+
+        // 先落盘再重建下游。
+        // 顺序很重要：以前先建 AdbClient/AiClient 再保存，中途任何一个环节抛异常，
+        // 用户刚改的配置就白改了（下次启动又回到默认）。现在保存排在最前面。
         _cfg.Save();
+
         _adb = new AdbClient(_cfg.Adb);
         RebuildAiClient();
-        Log.Info("配置已更新");
+        Log.Info($"配置已保存 → {AppConfig.DefaultPath}");
         SetStatus("配置已保存");
     }
 

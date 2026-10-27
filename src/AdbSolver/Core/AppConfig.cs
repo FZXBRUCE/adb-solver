@@ -184,6 +184,53 @@ public sealed class AppConfig
         }
     }
 
+    /// <summary>
+    /// 深拷贝。设置对话框拿副本去改，只有点「保存」才写回原对象——
+    /// 这样点「取消」或直接按 X 关掉时，内存里的配置也不会被偷偷改脏。
+    /// </summary>
+    public AppConfig Clone() => new()
+    {
+        SchemaVersion = SchemaVersion,
+        Adb = new AdbConfig
+        {
+            AdbPath = Adb.AdbPath,
+            DeviceSerial = Adb.DeviceSerial,
+            WifiTargets = new List<string>(Adb.WifiTargets),
+            AutoConnectWifi = Adb.AutoConnectWifi,
+            CaptureDir = Adb.CaptureDir,
+            CommandTimeoutMs = Adb.CommandTimeoutMs,
+        },
+        Capture = new CaptureConfig
+        {
+            Mode = Capture.Mode,
+            PollIntervalMs = Capture.PollIntervalMs,
+            DedupWindowMs = Capture.DedupWindowMs,
+            SettleDelayMs = Capture.SettleDelayMs,
+            KeepImages = Capture.KeepImages,
+            MaxKeptImages = Capture.MaxKeptImages,
+        },
+        Pipeline = new PipelineConfig
+        {
+            MinQuestionChars = Pipeline.MinQuestionChars,
+            EnableSearch = Pipeline.EnableSearch,
+            SearchResultHint = Pipeline.SearchResultHint,
+            CopyAnswerToClipboard = Pipeline.CopyAnswerToClipboard,
+            MaxConsecutiveFailures = Pipeline.MaxConsecutiveFailures,
+            AnswerStyle = Pipeline.AnswerStyle,
+        },
+        Endpoints = Endpoints.Select(e => e.Clone()).ToList(),
+    };
+
+    /// <summary>把另一份配置的内容拷回自己（引用保持不变，下游持有的是同一个对象）。</summary>
+    public void CopyFrom(AppConfig other)
+    {
+        SchemaVersion = other.SchemaVersion;
+        Adb = other.Adb;
+        Capture = other.Capture;
+        Pipeline = other.Pipeline;
+        Endpoints = other.Endpoints;
+    }
+
     /// <summary>补齐空目录、默认端点等，保证下游不为 null。</summary>
     public void Normalize()
     {

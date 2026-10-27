@@ -25,7 +25,10 @@ public sealed class EndpointEditorForm : Form
 
     public EndpointEditorForm(List<AiEndpointConfig> endpoints)
     {
-        _list = new BindingList<AiEndpointConfig>(endpoints);
+        // 必须深拷贝再绑。BindingList 包的是原 List 的引用，
+        // 直接绑上去的话「新增/删除/改字段」会立刻改到主配置那个 List 上，
+        // 用户点「取消」也回不去——配置就这么被"记住"成半成品了。
+        _list = new BindingList<AiEndpointConfig>(endpoints.Select(e => e.Clone()).ToList());
 
         Text = "AI 端点配置";
         Width = 1000;
@@ -193,7 +196,16 @@ public sealed class EndpointEditorForm : Form
             FlowDirection = FlowDirection.RightToLeft,
             Padding = new Padding(10, 8, 10, 8),
         };
-        var btnOk = new Button { Text = "确定", Width = 90, Height = 30, DialogResult = DialogResult.OK };
+        // 坑：「确定」原来只设了 DialogResult=OK 就直接关窗，编辑区里刚填的
+        // BaseUrl / ApiKey / Model 从来没被写回列表项——用户填完直接点确定，
+        // 等于白填，回到主界面还是空的。所以这里必须先 OnApplyQuiet() 再放行。
+        var btnOk = new Button { Text = "确定", Width = 90, Height = 30 };
+        btnOk.Click += (_, _) =>
+        {
+            OnApplyQuiet();
+            DialogResult = DialogResult.OK;
+            Close();
+        };
         var btnCancel = new Button { Text = "取消", Width = 90, Height = 30, DialogResult = DialogResult.Cancel };
         bottom.Controls.Add(btnOk);
         bottom.Controls.Add(btnCancel);

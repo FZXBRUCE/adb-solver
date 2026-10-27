@@ -26,3 +26,6 @@ Thumbs.db
 desktop.ini
 .DS_Store
 test-build/
+
+# 本地构建缓存
+.build-tmp/
