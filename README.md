@@ -87,6 +87,13 @@ API Key : sk-xxxxxxxx
 > **识图（OCR）必须用多模态模型**：`gpt-4o`、`claude-sonnet-4`、`gemini-2.0-flash`、`qwen-vl-max`、`glm-4v` 等。
 > 纯文本模型（如 `deepseek-chat`）只能做 Search 和 Solve，不要勾 OCR。
 
+> **模型名别手敲**：填完 BaseURL 和 API Key 后，点「模型」右边的 **「获取模型列表」**，
+> 程序会直接向服务端要可用模型清单，下拉选就行。
+> 中转站的模型名跟官方**不一样**（同一个模型可能叫 `claude-sonnet-4`、
+> `anthropic/claude-sonnet-4` 或站主自定义的别名），手敲十有八九被服务端以
+> `invalid model` 拒掉，而且报错信息根本猜不出正确的名字。
+> 极少数站没实现 `/models` 接口，那种才需要手敲（下拉框也允许直接输入）。
+
 ### 4. 开始监听
 
 选好设备 → 点「开始监听」→ 手机上随便截个图 → 看右侧出答案。
@@ -104,6 +111,8 @@ API Key : sk-xxxxxxxx
 - 通义千问：`https://dashscope.aliyuncs.com/compatible-mode/v1`
 - 智谱 GLM：`https://open.bigmodel.cn/api/paas/v4`
 - OneAPI / NewAPI / 各类中转：填你自己的地址
+
+> 中转站记得先点「获取模型列表」——它们的模型名是站主自己定的，跟官方对不上。
 
 ### Anthropic Claude 原生
 
