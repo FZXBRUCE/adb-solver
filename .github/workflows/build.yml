@@ -12,6 +12,12 @@ jobs:
   build:
     runs-on: windows-latest
 
+    # 默认 GITHUB_TOKEN 是只读的，softprops/action-gh-release 建 Release 会被拒：
+    #   403 Resource not accessible by integration
+    # 必须显式给 contents: write。
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
