@@ -12,8 +12,13 @@ public sealed class EndpointEditorForm : Form
     private readonly DataGridView _grid;
     private readonly TextBox _txtBaseUrl = new();
     private readonly TextBox _txtApiKey = new();
-    private readonly TextBox _txtModel = new();
+
+    // 模型名改成可编辑下拉框：中转站的模型名跟官方不一样，
+    // 手敲十有八九被服务端以 invalid model 拒掉，所以配一个「获取模型列表」直接问服务端要。
+    private readonly ComboBox _txtModel = new();
+
     private readonly ComboBox _cmbKind = new();
+    private readonly Button _btnFetchModels = new();
     private readonly TextBox _txtName = new();
     private readonly CheckedListBox _roles = new();
     private readonly CheckBox _chkEnabled = new();
@@ -97,7 +102,31 @@ public sealed class EndpointEditorForm : Form
         AddRow("协议", _cmbKind, 28);
         AddRow("BaseUrl", _txtBaseUrl, 28);
         AddRow("ApiKey", _txtApiKey, 28);
-        AddRow("模型", _txtModel, 28);
+
+        // 模型行：下拉框 + 「获取模型列表」按钮，横向排一行
+        _txtModel.DropDownStyle = ComboBoxStyle.DropDown;   // 可选可敲，兼容没实现 /models 的站
+        _txtModel.AutoCompleteMode = AutoCompleteMode.SuggestAppend;
+        _txtModel.AutoCompleteSource = AutoCompleteSource.ListItems;
+
+        var modelRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+        };
+        modelRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        modelRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
+        _txtModel.Dock = DockStyle.Fill;
+        _btnFetchModels.Text = "获取模型列表";
+        _btnFetchModels.Dock = DockStyle.Fill;
+        _btnFetchModels.Margin = new Padding(4, 0, 0, 0);
+        _btnFetchModels.Click += async (_, _) => await OnFetchModelsAsync();
+        modelRow.Controls.Add(_txtModel, 0, 0);
+        modelRow.Controls.Add(_btnFetchModels, 1, 0);
+
+        AddRow("模型", modelRow, 28);
 
         _txtApiKey.UseSystemPasswordChar = true;
 
@@ -146,6 +175,7 @@ public sealed class EndpointEditorForm : Form
             Dock = DockStyle.Top,
             Height = 60,
             Text = "提示：中转站一般选「OpenAI 兼容」，BaseUrl 填到 /v1 为止（如 https://xxx.com/v1）。\n" +
+                   "填完 BaseUrl 和 ApiKey 先点「获取模型列表」——中转站的模型名跟官方不一样，手敲容易被拒。\n" +
                    "识图能力需要模型支持多模态；纯文本模型请把它只勾选 Search/Solve。",
             ForeColor = Color.DimGray,
             Padding = new Padding(0, 8, 0, 0),
@@ -302,6 +332,98 @@ public sealed class EndpointEditorForm : Form
         {
             owner.Cursor = Cursors.Default;
             _ = btnText;
+        }
+    }
+
+    /// <summary>
+    /// 向服务端要模型清单，填进下拉框。
+    ///
+    /// 为什么要这个：中转站的模型名跟官方不一样，同一个模型在 A 站叫
+    /// `claude-sonnet-4`、在 B 站叫 `anthropic/claude-sonnet-4`、在 C 站
+    /// 可能叫站主自己起的别名。手敲错了服务端只回一句 invalid model，
+    /// 猜都猜不出来。直接拉清单选，省事。
+    /// </summary>
+    private async Task OnFetchModelsAsync()
+    {
+        var ep = Selected;
+        if (ep is null)
+        {
+            MessageBox.Show("先在左边选一个端点。", "提示");
+            return;
+        }
+
+        // 用编辑框里当前的 BaseUrl / ApiKey / 协议去拉，不是用已保存的旧值
+        var kind = (AiProviderKind)Math.Max(0, _cmbKind.SelectedIndex);
+        var baseUrl = _txtBaseUrl.Text.Trim();
+        var apiKey = _txtApiKey.Text.Trim();
+
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            MessageBox.Show("BaseUrl 是空的，先填地址。", "提示");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            MessageBox.Show("ApiKey 是空的，先填 Key 再拉模型列表。", "提示");
+            return;
+        }
+
+        var oldText = _btnFetchModels.Text;
+        _btnFetchModels.Enabled = false;
+        _btnFetchModels.Text = "获取中…";
+        var oldCursor = Cursor;
+        Cursor = Cursors.WaitCursor;
+
+        try
+        {
+            var r = await ModelCatalog.FetchAsync(kind, baseUrl, apiKey);
+
+            if (!r.Ok)
+            {
+                MessageBox.Show(
+                    $"没拉到模型列表：\n\n{r.Error}\n\n" +
+                    "常见原因：\n" +
+                    "· 这个站没实现 /models 接口（部分中转站如此）——那就只能手敲模型名\n" +
+                    "· Key 没有列模型的权限\n" +
+                    "· BaseUrl 填错了（OpenAI 兼容一般填到 /v1 为止）",
+                    "获取失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var keep = _txtModel.Text.Trim();
+
+            _txtModel.BeginUpdate();
+            _txtModel.Items.Clear();
+            foreach (var m in r.Models) _txtModel.Items.Add(m);
+            _txtModel.EndUpdate();
+
+            // 原来填的名字如果在清单里，就保留；不在就默认选第一个
+            var idx = -1;
+            for (var i = 0; i < _txtModel.Items.Count; i++)
+            {
+                if (string.Equals(_txtModel.Items[i]?.ToString(), keep, StringComparison.OrdinalIgnoreCase))
+                {
+                    idx = i;
+                    break;
+                }
+            }
+            _txtModel.SelectedIndex = idx >= 0 ? idx : 0;
+            _txtModel.Text = idx >= 0 ? keep : (_txtModel.Items[0]?.ToString() ?? keep);
+
+            MessageBox.Show($"拉到 {r.Models.Count} 个模型，已填进下拉框。\n\n" +
+                            "识图（Ocr 角色）要用支持多模态的模型，纯文本模型请只勾 Search/Solve。",
+                "OK", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"获取模型列表出错：{ex.GetType().Name}: {ex.Message}", "错误",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            Cursor = oldCursor;
+            _btnFetchModels.Text = oldText;
+            _btnFetchModels.Enabled = true;
         }
     }
 
