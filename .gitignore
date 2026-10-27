@@ -1,0 +1,18 @@
+# 编译产物
+bin/
+obj/
+dist/
+*.user
+*.suo
+.vs/
+
+# 运行数据（含 API Key，绝对不能提交）
+data/
+config.json
+selftest.txt
+*.log
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store

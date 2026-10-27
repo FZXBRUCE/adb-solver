@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>AdbSolver</RootNamespace>
+    <AssemblyName>AdbSolver</AssemblyName>
+
+    <!-- 自包含单文件：目标机器无需安装 .NET 运行时，杜绝"换个电脑就闪退" -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <NuGetAudit>false</NuGetAudit>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationDefaultFont>Microsoft YaHei UI, 9pt</ApplicationDefaultFont>
+
+    <Version>1.0.0</Version>
+    <AssemblyTitle>AdbSolver - ADB 截图自动答题</AssemblyTitle>
+    <Product>AdbSolver</Product>
+    <Company>Seagull</Company>
+    <Description>通过 ADB 监听手机截图，自动 OCR 识别题目、联网搜索并作答。</Description>
+  </PropertyGroup>
+
+  <!--
+    重要：本项目刻意不引用任何第三方 NuGet 包。
+    全部依赖仅使用 .NET 8 基础类库（System.Text.Json / System.Net.Http / System.Drawing / WinForms）。
+    这样在完全离线的构建环境里也能 restore + publish 成功。
+  -->
+
+</Project>

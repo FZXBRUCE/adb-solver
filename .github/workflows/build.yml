@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/AdbSolver/AdbSolver.csproj
+
+      - name: Build
+        run: dotnet build src/AdbSolver/AdbSolver.csproj -c Release --no-restore
+
+      - name: Publish single-file EXE
+        run: >
+          dotnet publish src/AdbSolver/AdbSolver.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -o dist/win-x64
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $exe = "dist/win-x64/AdbSolver.exe"
+          if (-not (Test-Path $exe)) { throw "EXE not produced" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "AdbSolver.exe = $size MB"
+          # --selftest 不弹窗，只打印并写文件，退出码 0
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru -Wait -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "selftest failed with exit $($p.ExitCode)" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdbSolver-win-x64
+          path: dist/win-x64/AdbSolver.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/win-x64/AdbSolver.exe
+          generate_release_notes: true
