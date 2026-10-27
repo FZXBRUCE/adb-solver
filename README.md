@@ -38,6 +38,19 @@
 
 ---
 
+## 下载（普通用户看这里）
+
+**不用编译，不用装 .NET，不用克隆仓库。**
+
+去 [Releases](https://github.com/<your-name>/adb-solver/releases) 页面，
+下载最新的 `AdbSolver.exe`，双击就能用。
+
+就这一个文件。想卸载？直接删掉，连注册表都不留。
+
+> 仓库里的源码是给想改代码、想自己编译的人看的。**普通用户不需要碰。**
+
+---
+
 ## 快速开始
 
 ### 1. 准备 ADB
@@ -172,24 +185,29 @@ adb-solver/
 
 ---
 
-## 自己编译
+## 自己编译（开发者看这里）
 
 需要 .NET 8 SDK。
 
+**普通用户不需要看这一节** —— 直接去 Releases 下 EXE 就行。
+
 ```bash
 git clone https://github.com/<your-name>/adb-solver.git
-cd adb-solver/src/AdbSolver
+cd adb-solver
 
-# 调试运行
-dotnet run
-
-# 打包单文件 EXE（自包含，约 130MB）
-dotnet publish -c Release -r win-x64 --self-contained true \
+# 一键构建（自动做单文件、清理用不到的 WPF 原生库）
+dotnet publish src/AdbSolver/AdbSolver.csproj -c Release -r win-x64 \
+  --self-contained true \
   -p:PublishSingleFile=true \
-  -p:IncludeNativeLibrariesForSelfExtract=false \
-  -p:EnableCompressionInSingleFile=false \
   -p:DebugType=none \
-  -o ../../publish
+  -o publish
+```
+
+调试运行：
+
+```bash
+cd src/AdbSolver
+dotnet run
 ```
 
 产物：`publish/AdbSolver.exe`，**就这一个文件**，双击即用。
