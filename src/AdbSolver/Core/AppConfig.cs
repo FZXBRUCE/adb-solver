@@ -26,8 +26,7 @@ public sealed class AiEndpointConfig
     public bool Enabled { get; set; } = true;
 
     /// <summary>
-    /// 该端点承担哪些角色：Ocr=识图, Search=联网搜索, Solve=作答。
-    /// 留空表示三个角色都能干。
+    /// 该端点承担哪些角色：Ocr=识图+切题, Solve=作答。列表为空表示全都干。
     /// </summary>
     public List<string> Roles { get; set; } = new();
 
@@ -76,13 +75,17 @@ public sealed class CaptureConfig
     public CaptureMode Mode { get; set; } = CaptureMode.Hybrid;
 
     /// <summary>轮询间隔（毫秒）。越小越灵敏，越大越省电。</summary>
-    public int PollIntervalMs { get; set; } = 700;
+    public int PollIntervalMs { get; set; } = 250;
 
     /// <summary>去重时间窗（毫秒）。同一张图在这段时间内不重复处理。</summary>
     public int DedupWindowMs { get; set; } = 2500;
 
-    /// <summary>截图后等待文件写盘完成的额外延时（毫秒）。</summary>
-    public int SettleDelayMs { get; set; } = 350;
+    /// <summary>
+    /// 截图后等待文件写盘完成的额外延时（毫秒）。
+    /// 默认 0：监听到的本来就是已落盘的文件，再等纯属白等；
+    /// 个别机型拉到半张图时再加到 100~200。
+    /// </summary>
+    public int SettleDelayMs { get; set; } = 0;
 
     /// <summary>是否保留截图原图。</summary>
     public bool KeepImages { get; set; } = true;
@@ -101,16 +104,56 @@ public enum CaptureMode
     Hybrid = 2,
 }
 
+/// <summary>
+/// 反检测 / 隐身配置。
+///
+/// 这里能做的和不能做的，先说清楚，免得用户以为开了就无敌：
+///
+/// 【改不动的】目标 App 如果查 Settings.Global.ADB_ENABLED、扫 /proc/net/tcp 看
+/// 有没有连 5037、或者直接调 UsbManager 看调试状态，PC 端无论怎么改都绕不过去——
+/// 那些检测跑在手机上，主动权在 App 手里。本模块不声称能解决这类。
+///
+/// 【能改的】工具在设备上留下的痕迹、在 PC 上留下的痕迹、以及操作节奏：
+///   1. 临时文件不再落 /sdcard（那是人尽可读的共享存储），改走 exec-out 直出，
+///      连文件都不产生；真需要落盘时也只用随机名并立刻删除。
+///   2. PC 端进程名、窗口标题、数据目录名可改，避免肉眼和任务管理器一眼认出。
+///   3. 操作节奏加抖动，别像机器一样固定毫秒节奏。
+/// </summary>
+public sealed class StealthConfig
+{
+    /// <summary>总开关。关掉时所有行为与老版本完全一致。</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// 截图走 exec-out 直出内存，不在设备上产生任何文件。
+    /// 关掉会退回老的 /sdcard 落盘 + pull 方式（会在共享存储留痕）。
+    /// </summary>
+    public bool CaptureInMemory { get; set; } = true;
+
+    /// <summary>
+    /// 必须落盘时的目录。默认 /data/local/tmp —— 比 /sdcard 强得多：
+    /// 普通 App 没有权限读这个目录（Android 11+ 的 scoped storage 更是直接隔死），
+    /// 而 shell 用户往里写是完全合法的，看起来跟系统临时文件没区别。
+    /// </summary>
+    public string RemoteTempDir { get; set; } = "/data/local/tmp";
+
+    /// <summary>临时文件名是否随机化（不用固定名，避免按名字扫）。</summary>
+    public bool RandomizeTempNames { get; set; } = true;
+
+    /// <summary>PC 端窗口标题。留空则用默认标题。</summary>
+    public string WindowTitle { get; set; } = "";
+
+    /// <summary>轮询间隔的随机抖动比例（0~0.5）。0=固定节奏，0.3=±30%。</summary>
+    public double PollJitter { get; set; } = 0.3;
+
+    /// <summary>隐藏窗口标题里的版本号 / 工具名之类可识别字样。</summary>
+    public bool DiscreetTitle { get; set; } = true;
+}
+
 public sealed class PipelineConfig
 {
     /// <summary>识别到的文本最少多少字符才当作有效题目。</summary>
     public int MinQuestionChars { get; set; } = 8;
-
-    /// <summary>是否开启"先搜索再作答"两段式。关掉则一步直接作答。</summary>
-    public bool EnableSearch { get; set; } = true;
-
-    /// <summary>搜索阶段每个端点最多返回的结果条数提示。</summary>
-    public int SearchResultHint { get; set; } = 5;
 
     /// <summary>是否把最终答案自动写入剪贴板。</summary>
     public bool CopyAnswerToClipboard { get; set; } = true;
@@ -129,6 +172,7 @@ public sealed class AppConfig
     public AdbConfig Adb { get; set; } = new();
     public CaptureConfig Capture { get; set; } = new();
     public PipelineConfig Pipeline { get; set; } = new();
+    public StealthConfig Stealth { get; set; } = new();
     public List<AiEndpointConfig> Endpoints { get; set; } = new();
 
     // ---- 持久化 ----
@@ -212,11 +256,19 @@ public sealed class AppConfig
         Pipeline = new PipelineConfig
         {
             MinQuestionChars = Pipeline.MinQuestionChars,
-            EnableSearch = Pipeline.EnableSearch,
-            SearchResultHint = Pipeline.SearchResultHint,
             CopyAnswerToClipboard = Pipeline.CopyAnswerToClipboard,
             MaxConsecutiveFailures = Pipeline.MaxConsecutiveFailures,
             AnswerStyle = Pipeline.AnswerStyle,
+        },
+        Stealth = new StealthConfig
+        {
+            Enabled = Stealth.Enabled,
+            CaptureInMemory = Stealth.CaptureInMemory,
+            RemoteTempDir = Stealth.RemoteTempDir,
+            RandomizeTempNames = Stealth.RandomizeTempNames,
+            WindowTitle = Stealth.WindowTitle,
+            PollJitter = Stealth.PollJitter,
+            DiscreetTitle = Stealth.DiscreetTitle,
         },
         Endpoints = Endpoints.Select(e => e.Clone()).ToList(),
     };
@@ -228,6 +280,7 @@ public sealed class AppConfig
         Adb = other.Adb;
         Capture = other.Capture;
         Pipeline = other.Pipeline;
+        Stealth = other.Stealth;
         Endpoints = other.Endpoints;
     }
 
@@ -237,8 +290,16 @@ public sealed class AppConfig
         Adb ??= new AdbConfig();
         Capture ??= new CaptureConfig();
         Pipeline ??= new PipelineConfig();
+        // 老版本 config.json 里没有 Stealth 节点，反序列化出来就是 null。
+        // 这里必须补一个默认对象，否则下游任何 stealth.X 都是 NullReferenceException，
+        // 表现就是"升级后一启动就闪退"。
+        Stealth ??= new StealthConfig();
         Endpoints ??= new List<AiEndpointConfig>();
         Adb.WifiTargets ??= new List<string>();
+
+        if (string.IsNullOrWhiteSpace(Stealth.RemoteTempDir))
+            Stealth.RemoteTempDir = "/data/local/tmp";
+        Stealth.PollJitter = Math.Clamp(Stealth.PollJitter, 0, 0.5);
 
         if (string.IsNullOrWhiteSpace(Adb.CaptureDir))
             Adb.CaptureDir = Path.Combine(AppPaths.DataDir, "captures");
@@ -251,7 +312,7 @@ public sealed class AppConfig
                 Kind = AiProviderKind.OpenAiCompatible,
                 BaseUrl = "https://api.deepseek.com/v1",
                 Model = "deepseek-chat",
-                Roles = new List<string> { "Ocr", "Search", "Solve" },
+                Roles = new List<string> { "Ocr", "Solve" },
             });
         }
 

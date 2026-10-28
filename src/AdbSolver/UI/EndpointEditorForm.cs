@@ -139,7 +139,7 @@ public sealed class EndpointEditorForm : Form
             TextAlign = ContentAlignment.TopLeft,
             Dock = DockStyle.Fill,
         };
-        _roles.Items.AddRange(new object[] { "Ocr（识图）", "Search（检索）", "Solve（作答）" });
+        _roles.Items.AddRange(new object[] { "Ocr（识图/切题）", "Solve（作答）" });
         _roles.Height = 74;
         _roles.Dock = DockStyle.Fill;
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
@@ -179,7 +179,7 @@ public sealed class EndpointEditorForm : Form
             Height = 60,
             Text = "提示：中转站一般选「OpenAI 兼容」，BaseUrl 填到 /v1 为止（如 https://xxx.com/v1）。\n" +
                    "填完 BaseUrl 和 ApiKey 先点「获取模型列表」——中转站的模型名跟官方不一样，手敲容易被拒。\n" +
-                   "识图能力需要模型支持多模态；纯文本模型请把它只勾选 Search/Solve。",
+                   "识图能力需要模型支持多模态；纯文本模型请只勾选 Solve。",
             ForeColor = Color.DimGray,
             Padding = new Padding(0, 8, 0, 0),
         };
@@ -266,7 +266,7 @@ public sealed class EndpointEditorForm : Form
         _chkEnabled.Checked = ep.Enabled;
         for (var i = 0; i < _roles.Items.Count; i++)
         {
-            var key = new[] { "Ocr", "Search", "Solve" }[i];
+            var key = new[] { "Ocr", "Solve" }[i];
             _roles.SetItemChecked(i, ep.Roles.Any(r => string.Equals(r, key, StringComparison.OrdinalIgnoreCase)));
         }
     }
@@ -309,7 +309,7 @@ public sealed class EndpointEditorForm : Form
         ep.Model = _txtModel.Text.Trim();
         ep.Enabled = _chkEnabled.Checked;
         ep.Roles.Clear();
-        var keys = new[] { "Ocr", "Search", "Solve" };
+        var keys = new[] { "Ocr", "Solve" };
         for (var i = 0; i < _roles.Items.Count; i++)
             if (_roles.GetItemChecked(i))
                 ep.Roles.Add(keys[i]);
@@ -423,7 +423,7 @@ public sealed class EndpointEditorForm : Form
             _txtModel.Text = idx >= 0 ? keep : (_txtModel.Items[0]?.ToString() ?? keep);
 
             MessageBox.Show($"拉到 {r.Models.Count} 个模型，已填进下拉框。\n\n" +
-                            "识图（Ocr 角色）要用支持多模态的模型，纯文本模型请只勾 Search/Solve。",
+                            "识图（Ocr 角色）要用支持多模态的模型；纯文本模型请只勾 Solve。",
                 "OK", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
@@ -450,7 +450,7 @@ public sealed class EndpointEditorForm : Form
         ep.Model = _txtModel.Text.Trim();
         ep.Enabled = _chkEnabled.Checked;
         ep.Roles.Clear();
-        var keys = new[] { "Ocr", "Search", "Solve" };
+        var keys = new[] { "Ocr", "Solve" };
         for (var i = 0; i < _roles.Items.Count; i++)
             if (_roles.GetItemChecked(i))
                 ep.Roles.Add(keys[i]);

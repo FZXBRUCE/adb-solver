@@ -11,13 +11,13 @@ adb-solver
 **推荐这个（中文，118 字符）：**
 
 ```
-通过 ADB 监听安卓手机截图，自动 OCR 识别题目、联网检索、调用大模型作答。单文件 EXE，绿色免安装，不依赖 .NET 运行时，换台电脑也不闪退。
+通过 ADB 监听安卓手机截图，自动识别题目、调用大模型作答。单文件 EXE，绿色免安装，不依赖 .NET 运行时。
 ```
 
 **英文版（面向国际用户，142 字符）：**
 
 ```
-Monitor Android screenshots via ADB, auto-OCR the question, search the web, and answer with an LLM. Single-file EXE, portable, no .NET runtime required.
+Monitor Android screenshots via ADB, recognize the question, and answer with an LLM. Single-file EXE, portable, no .NET runtime required.
 ```
 
 ## 3. Topics（建完库后在 About 右侧齿轮里加）
@@ -44,7 +44,7 @@ portable
 ## 4. 建库时怎么勾
 
 - **Public**（要别人能下 Release 就必须 Public）
-- **不要**勾 Add a README / .gitignore / license —— 仓库里已经有了，勾了会冲突，push 时要处理
+- 不要勾 Add a README / .gitignore / license，仓库里已经有了，勾了会冲突，push 时要处理
 - 直接建空仓库
 
 ## 5. 建完执行

@@ -20,7 +20,10 @@ public sealed class ScreenshotWatcher : IDisposable
 {
     private readonly AdbClient _adb;
     private readonly CaptureConfig _cfg;
+    private readonly StealthConfig? _stealth;
     private readonly string _serial;
+
+    private readonly Random _rng = new();
 
     private CancellationTokenSource? _cts;
     private Task? _mediaTask;
@@ -49,11 +52,36 @@ public sealed class ScreenshotWatcher : IDisposable
     /// <summary>诊断信息：最近一次各通道的原始返回，供 UI 排查。</summary>
     public string LastDiagnostics { get; private set; } = "";
 
-    public ScreenshotWatcher(AdbClient adb, CaptureConfig cfg, string serial)
+    public ScreenshotWatcher(AdbClient adb, CaptureConfig cfg, string serial, StealthConfig? stealth = null)
     {
         _adb = adb;
         _cfg = cfg;
+        _stealth = stealth;
         _serial = serial;
+    }
+
+    /// <summary>
+    /// 下一次轮询等多久。
+    ///
+    /// 固定间隔（比如永远 250ms）在设备端看起来就是个精确的节拍器：每 250.0ms
+    /// 一次 content query、一次 ls，一个小时下来误差始终是毫秒级 —— 人工操作
+    /// 不可能这么规整。加了抖动之后间隔在 ±30% 之间随机漂移，跟人偶尔想起来
+    /// 看一眼的节奏接近。
+    ///
+    /// 关掉反检测时返回原始固定间隔，行为和以前一模一样。
+    /// </summary>
+    private int NextInterval(int baseMs)
+    {
+        var jitter = _stealth is { Enabled: true } ? _stealth.PollJitter : 0;
+        if (jitter <= 0) return baseMs;
+
+        // [base*(1-j), base*(1+j)]，下限 120ms 免得把自己压成死循环
+        var lo = baseMs * (1 - jitter);
+        var hi = baseMs * (1 + jitter);
+        lock (_rng)
+        {
+            return Math.Max(120, (int)(lo + _rng.NextDouble() * (hi - lo)));
+        }
     }
 
     private string CaptureDir
@@ -149,7 +177,7 @@ public sealed class ScreenshotWatcher : IDisposable
         catch (OperationCanceledException) { return; }
         catch (TimeoutException) { }
 
-        var interval = Math.Max(200, _cfg.PollIntervalMs);
+        var interval = Math.Max(120, _cfg.PollIntervalMs);
         var errCount = 0;
 
         while (!ct.IsCancellationRequested)
@@ -174,7 +202,7 @@ public sealed class ScreenshotWatcher : IDisposable
                     Log.Debug($"媒体库轮询异常(#{errCount}): {ex.Message}");
             }
 
-            try { await Task.Delay(interval, ct).ConfigureAwait(false); }
+            try { await Task.Delay(NextInterval(interval), ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
         }
     }
@@ -195,7 +223,7 @@ public sealed class ScreenshotWatcher : IDisposable
         catch (OperationCanceledException) { return; }
         catch (TimeoutException) { }
 
-        var interval = Math.Max(300, _cfg.PollIntervalMs);
+        var interval = Math.Max(120, _cfg.PollIntervalMs);
         var errCount = 0;
 
         while (!ct.IsCancellationRequested)
@@ -229,7 +257,7 @@ public sealed class ScreenshotWatcher : IDisposable
                     Log.Debug($"目录轮询异常(#{errCount}): {ex.Message}");
             }
 
-            try { await Task.Delay(interval, ct).ConfigureAwait(false); }
+            try { await Task.Delay(NextInterval(interval), ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
         }
     }

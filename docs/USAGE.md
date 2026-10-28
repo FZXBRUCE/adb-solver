@@ -260,7 +260,7 @@ Failed to create directory [C:\Users\...\Temp\.net\AdbSolver\xxxx] for extractin
 
 如果换成新版后仍报
 `UnauthorizedAccessException: Access to the path '...\Temp\xxxx.tmp' is denied`，
-那是 `Application.EnableVisualStyles()` 要写 activation context 清单 ——
+那是 `Application.EnableVisualStyles()` 在写 activation context 清单，
 新版本已把它包在 try/catch 里，视觉样式要不到也照常启动。
 
 ### adb 找不到

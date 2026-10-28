@@ -43,7 +43,11 @@ public sealed class MainForm : Form
     {
         _cfg = AppConfig.Load();
 
-        Text = "AdbSolver · ADB 截图自动答题";
+        Text = _cfg.Stealth is { Enabled: true }
+            ? (_cfg.Stealth.DiscreetTitle ? "截图工具" : "ADB 截图答题")
+            : "AdbSolver · ADB 截图自动答题";
+        if (_cfg.Stealth is { Enabled: true } && !string.IsNullOrWhiteSpace(_cfg.Stealth.WindowTitle))
+            Text = _cfg.Stealth.WindowTitle;
         Width = 1280;
         Height = 820;
         MinimumSize = new Size(980, 640);
@@ -213,11 +217,11 @@ public sealed class MainForm : Form
         qPanel.Controls.Add(_lblQuestion);
         qPanel.Controls.Add(qHead);
 
-        // 检索结论
+        // 模型识别原文
         var sPanel = new Panel { Dock = DockStyle.Top, Height = 88, Padding = new Padding(0, 8, 0, 0) };
         var sHead = new Label
         {
-            Text = "检索/推理结论",
+            Text = "模型识别原文（排查识别错误用）",
             Dock = DockStyle.Top,
             Height = 20,
             Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold),
@@ -344,7 +348,7 @@ public sealed class MainForm : Form
         Log.Info($"数据目录: {AppPaths.DataDir}");
         Log.Info($"配置文件: {AppConfig.DefaultPath}");
 
-        _adb = new AdbClient(_cfg.Adb);
+        _adb = new AdbClient(_cfg.Adb, _cfg.Stealth);
         Log.Info($"adb 路径: {_adb.AdbPath} (存在: {_adb.AdbExists})");
 
         if (!_adb.AdbExists)
@@ -496,7 +500,7 @@ public sealed class MainForm : Form
             _watcher.Stop();
             _watcher.Dispose();
 
-            _watcher = new ScreenshotWatcher(_adb!, _cfg.Capture, item.Info.Serial);
+            _watcher = new ScreenshotWatcher(_adb!, _cfg.Capture, item.Info.Serial, _cfg.Stealth);
             _watcher.OnScreenshot += OnNewScreenshot;
             _watcher.OnStatus += s => Ui(() => SetStatus(s));
             _watcher.Start();
@@ -573,7 +577,7 @@ public sealed class MainForm : Form
         _pipeline?.ResetFailureCounter();
         _queued = 0;
 
-        _watcher = new ScreenshotWatcher(_adb, _cfg.Capture, dev.Serial);
+        _watcher = new ScreenshotWatcher(_adb, _cfg.Capture, dev.Serial, _cfg.Stealth);
         _watcher.OnScreenshot += OnNewScreenshot;
         _watcher.OnStatus += s => Ui(() => SetStatus(s));
         _watcher.Start();
@@ -675,7 +679,9 @@ public sealed class MainForm : Form
         {
             _lblAnswer.Text = string.IsNullOrWhiteSpace(outcome.Answer) ? "（空）" : outcome.Answer;
             _lblQuestion.Text = outcome.Question.Question.Replace("\n", "  ");
-            _txtSearch.Text = string.IsNullOrWhiteSpace(outcome.SearchNotes) ? "（未启用检索）" : outcome.SearchNotes;
+            // 原来这块显示"检索结论"，现在没有检索阶段了，改成显示模型看图的原始输出，
+            // 排查识别错误时有用（题目切歪了能立刻看出是认错字还是解析错）。
+            _txtSearch.Text = string.IsNullOrWhiteSpace(outcome.OcrText) ? "（无）" : outcome.OcrText;
 
             var summary = $"{DateTime.Now:HH:mm:ss}  {outcome.Answer.Replace("\n", " ")}";
             _lstHistory.Items.Insert(0, summary);
@@ -741,7 +747,7 @@ public sealed class MainForm : Form
         // 用户刚改的配置就白改了（下次启动又回到默认）。现在保存排在最前面。
         _cfg.Save();
 
-        _adb = new AdbClient(_cfg.Adb);
+        _adb = new AdbClient(_cfg.Adb, _cfg.Stealth);
         RebuildAiClient();
         Log.Info($"配置已保存 → {AppConfig.DefaultPath}");
         SetStatus("配置已保存");

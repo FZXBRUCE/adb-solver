@@ -97,7 +97,7 @@ internal static class Program
         var cfg = AppConfig.Load();
         sb.AppendLine($"端点数量 : {cfg.Endpoints.Count}（启用 {cfg.Endpoints.Count(e => e.Enabled)}）");
 
-        var adb = new AdbClient(cfg.Adb);
+        var adb = new AdbClient(cfg.Adb, cfg.Stealth);
         sb.AppendLine($"adb 路径 : {adb.AdbPath}");
         sb.AppendLine($"adb 存在 : {adb.AdbExists}");
 
@@ -139,7 +139,7 @@ internal static class Program
         W("=== 截图链路诊断 ===");
 
         var cfg = AppConfig.Load();
-        var adb = new AdbClient(cfg.Adb);
+        var adb = new AdbClient(cfg.Adb, cfg.Stealth);
         W($"adb: {adb.AdbPath} (存在={adb.AdbExists})");
         if (!adb.AdbExists) { Flush(sb); return; }
 
@@ -182,7 +182,7 @@ internal static class Program
 
         // 4. 实时监听
         W("\n[4] 实时监听 25 秒 —— 现在去手机上截个图");
-        var watcher = new ScreenshotWatcher(adb, cfg.Capture, serial);
+        var watcher = new ScreenshotWatcher(adb, cfg.Capture, serial, cfg.Stealth);
         var hits = new List<string>();
         watcher.OnScreenshot += p => { lock (hits) hits.Add(p); W($"  ★ 命中: {p}"); };
         watcher.OnStatus += s => W($"  · {s}");

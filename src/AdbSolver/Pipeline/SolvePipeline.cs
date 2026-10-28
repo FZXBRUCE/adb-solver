@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Drawing;
 using AdbSolver.Ai;
 using AdbSolver.Core;
 
@@ -31,7 +32,12 @@ public sealed record SolveOutcome
 }
 
 /// <summary>
-/// 核心流水线：截图 → OCR → 题目解析 → 搜索 → 作答。
+/// 核心流水线：截图 → 看题+解析（一趟）→ 作答。
+///
+/// 历史上这里是四段：OCR → 解析 → 搜索 → 作答。前三段里有两段都在看同一张图/同一段字，
+/// 纯粹的重复劳动，一轮网络往返白烧 1.5~3 秒；搜索阶段在"AI 端点已经换成了大模型"的
+/// 前提下更是多余（自己就是搜索引擎，还去问另一个模型要不要搜）。现在压成两趟。
+///
 /// 每个阶段都单独容错，任何一个阶段失败都不会让整个程序崩溃。
 /// </summary>
 public sealed class SolvePipeline
@@ -63,45 +69,40 @@ public sealed class SolvePipeline
 
         try
         {
-            // ---------- 阶段 1：OCR ----------
-            stage = "OCR 识别";
+            // ---------- 阶段 1：看图 + 解析（合并为一趟）----------
+            stage = "识别题目";
             OnStage?.Invoke(stage);
+
             var (b64, mime) = await LoadImageAsync(imagePath, ct).ConfigureAwait(false);
             if (b64 is null)
                 return Fail("图片读取失败", sw, imagePath);
 
-            var ocr = await _ai.ChatAsync("Ocr", Prompts.OcrSystem, Prompts.OcrUser, b64, mime,
-                temperature: 0.0, maxTokens: 3000, ct: ct).ConfigureAwait(false);
+            var vision = await _ai.ChatAsync("Ocr", Prompts.VisionSystem, Prompts.VisionUser,
+                b64, mime, temperature: 0.0, maxTokens: 3000, ct: ct).ConfigureAwait(false);
 
-            if (!ocr.Ok)
-                return Fail("OCR 失败：" + ocr.Error, sw, imagePath);
+            if (!vision.Ok)
+                return Fail("识别失败：" + vision.Error, sw, imagePath);
 
-            var ocrText = CleanOcr(ocr.Text);
-            Log.Info($"OCR 完成（{ocr.ProviderName}）：{ocrText.Length} 字符");
+            // 原始模型输出（含 TYPE/QUESTION/OPTIONS 块），原样留一份给界面展示
+            var rawText = CleanOcr(vision.Text);
+            Log.Info($"识别完成（{vision.ProviderName}）：{rawText.Length} 字符");
 
-            if (ocrText.Equals("EMPTY", StringComparison.OrdinalIgnoreCase) || ocrText.Length < 2)
+            if (rawText.Length < 2)
             {
                 Log.Info("截图无有效文字，跳过");
                 return new SolveOutcome { Ok = false, Error = "截图无可识别文字", ImagePath = imagePath, Elapsed = sw.Elapsed };
             }
 
-            // ---------- 阶段 2：题目解析 ----------
-            stage = "题目解析";
-            OnStage?.Invoke(stage);
-            var parseUser = string.Format(Prompts.ParseUserTemplate, ocrText);
-            var parsed = await _ai.ChatAsync("Ocr", Prompts.ParseSystem, parseUser,
-                temperature: 0.0, maxTokens: 1500, ct: ct).ConfigureAwait(false);
+            var q = ParseQuestionBlock(rawText);
 
-            var q = parsed.Ok ? ParseQuestionBlock(parsed.Text) : ParseQuestionBlock(ocrText);
-
-            // 解析失败时降级：直接把 OCR 文本当题干
-            if (q.IsEmpty && ocrText.Length >= _cfg.MinQuestionChars)
+            // 解析失败时降级：把模型返回的整段文字当题干
+            if (q.IsEmpty && rawText.Length >= _cfg.MinQuestionChars)
             {
-                Log.Warn("题目解析结果为空，降级使用 OCR 全文作为题干");
+                Log.Warn("结构化解析为空，降级使用全文作为题干");
                 q = new ParsedQuestion
                 {
-                    Type = GuessType(ocrText),
-                    Question = ocrText,
+                    Type = GuessType(rawText),
+                    Question = rawText,
                     Options = "",
                     AnswerFormat = "",
                 };
@@ -109,12 +110,13 @@ public sealed class SolvePipeline
 
             if (q.IsEmpty)
             {
+                // 没有题目就别浪费第二次请求
                 Log.Info("未从截图中解析出有效题目，跳过");
                 return new SolveOutcome
                 {
                     Ok = false,
                     Error = "未解析出有效题目",
-                    OcrText = ocrText,
+                    OcrText = rawText,
                     Question = q,
                     ImagePath = imagePath,
                     Elapsed = sw.Elapsed,
@@ -128,7 +130,7 @@ public sealed class SolvePipeline
                 {
                     Ok = false,
                     Error = "题干过短",
-                    OcrText = ocrText,
+                    OcrText = rawText,
                     Question = q,
                     ImagePath = imagePath,
                     Elapsed = sw.Elapsed,
@@ -137,45 +139,19 @@ public sealed class SolvePipeline
 
             Log.Info($"题目: [{q.Type}] {Truncate(q.Question, 80)}");
 
-            // ---------- 阶段 3：搜索 ----------
-            var searchNotes = "";
-            if (_cfg.EnableSearch)
-            {
-                stage = "联网检索";
-                OnStage?.Invoke(stage);
-                var searchUser = string.Format(Prompts.SearchUserTemplate,
-                    q.Type, q.Question, string.IsNullOrWhiteSpace(q.Options) ? "NONE" : q.Options);
-
-                var searchRes = await _ai.ChatAsync("Search", Prompts.SearchSystem, searchUser,
-                    temperature: 0.3, maxTokens: 1500, ct: ct).ConfigureAwait(false);
-
-                if (searchRes.Ok)
-                {
-                    searchNotes = searchRes.Text.Trim();
-                    Log.Info($"检索完成（{searchRes.ProviderName}）");
-                }
-                else
-                {
-                    Log.Warn("检索阶段失败，将直接作答：" + searchRes.Error);
-                }
-            }
-
-            // ---------- 阶段 4：作答 ----------
+            // ---------- 阶段 2：作答 ----------
             stage = "生成答案";
             OnStage?.Invoke(stage);
+
             var solveSystem = string.Format(Prompts.SolveSystemTemplate, _cfg.AnswerStyle);
-            var solveUser = _cfg.EnableSearch
-                ? string.Format(Prompts.SolveUserTemplate, q.Type, q.Question,
-                    string.IsNullOrWhiteSpace(q.Options) ? "NONE" : q.Options,
-                    string.IsNullOrWhiteSpace(searchNotes) ? "(无参考资料)" : searchNotes)
-                : string.Format(Prompts.DirectSolveUserTemplate, q.Type, q.Question,
-                    string.IsNullOrWhiteSpace(q.Options) ? "NONE" : q.Options);
+            var solveUser = string.Format(Prompts.SolveUserTemplate, q.Type, q.Question,
+                string.IsNullOrWhiteSpace(q.Options) ? "NONE" : q.Options);
 
             var answer = await _ai.ChatAsync("Solve", solveSystem, solveUser,
                 temperature: 0.2, maxTokens: 1200, ct: ct).ConfigureAwait(false);
 
             if (!answer.Ok)
-                return Fail("作答失败：" + answer.Error, sw, imagePath, ocrText, q, searchNotes);
+                return Fail("作答失败：" + answer.Error, sw, imagePath, rawText, q);
 
             var finalAnswer = CleanAnswer(answer.Text);
 
@@ -185,9 +161,9 @@ public sealed class SolvePipeline
             var outcome = new SolveOutcome
             {
                 Ok = true,
-                OcrText = ocrText,
+                OcrText = rawText,
                 Question = q,
-                SearchNotes = searchNotes,
+                SearchNotes = "",
                 Answer = finalAnswer,
                 Elapsed = sw.Elapsed,
                 ImagePath = imagePath,
@@ -288,8 +264,11 @@ public sealed class SolvePipeline
 
             if (capturing)
             {
-                // 遇到下一个大写字段名就停
-                if (Regex.IsMatch(trimmed, @"^[A-Z_]{3,}:\s"))
+                // 遇到下一个大写字段名就停。
+                // 注意这里不能要求冒号后必须有空白：模型经常把 "OPTIONS:" 单独占一行，
+                // 冒号后直接就是换行，老写法 ^[A-Z_]{3,}:\s 匹配不上，
+                // 结果 QUESTION 字段会把 OPTIONS 整块吞进去，"题干"里混进四个选项。
+                if (Regex.IsMatch(trimmed, @"^[A-Z][A-Z_]{2,}:"))
                     break;
                 sb.AppendLine(line);
             }
@@ -343,25 +322,86 @@ public sealed class SolvePipeline
         return s.Trim();
     }
 
-    /// <summary>读图并转 base64。</summary>
+    /// <summary>
+    /// 读图并转 base64。
+    ///
+    /// 顺手压缩：手机截屏 1440×3200 的 PNG 动辄 3~6MB，base64 后请求体直接飙到 8MB，
+    /// 上传纯属白烧时间。压到最长边 1280 的 JPEG q85 一般只有 200~400KB，
+    /// 题目文字该清楚的还是清楚（实测 12px 中文照样认得出）。
+    /// 只有小图或本来就是小体积的才原样发。
+    /// </summary>
     private static async Task<(string? Base64, string Mime)> LoadImageAsync(string path, CancellationToken ct)
     {
         try
         {
             if (!File.Exists(path)) return (null, "image/png");
 
-            // 大于 4MB 的图先不做特殊处理，直接发（绝大多数截图都远小于这个值）
             var bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
             if (bytes.Length == 0) return (null, "image/png");
 
-            var mime = DetectMime(bytes);
-            return (Convert.ToBase64String(bytes), mime);
+            // 已经在 400KB 以下的就不用折腾了，直接发原始字节
+            if (bytes.Length <= 400 * 1024)
+                return (Convert.ToBase64String(bytes), DetectMime(bytes));
+
+            var (small, ok) = TryCompress(bytes);
+            if (ok && small is not null && small.Length < bytes.Length)
+            {
+                Log.Info($"图片压缩：{bytes.Length / 1024}KB → {small.Length / 1024}KB");
+                return (Convert.ToBase64String(small), "image/jpeg");
+            }
+
+            return (Convert.ToBase64String(bytes), DetectMime(bytes));
         }
         catch (Exception ex)
         {
             Log.Error("读取图片失败", ex);
             return (null, "image/png");
         }
+    }
+
+    /// <summary>压缩到最长边 1280、JPEG q85。任何异常都当失败处理，回退原图。</summary>
+    private static (byte[]? Bytes, bool Ok) TryCompress(byte[] src)
+    {
+        try
+        {
+            using var input = Image.FromStream(new MemoryStream(src), false, false);
+
+            const int maxSide = 1280;
+            var scale = Math.Min(1.0, (double)maxSide / Math.Max(input.Width, input.Height));
+            var w = Math.Max(1, (int)Math.Round(input.Width * scale));
+            var h = Math.Max(1, (int)Math.Round(input.Height * scale));
+
+            using var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.DrawImage(input, 0, 0, w, h);
+            }
+
+            var codec = GetJpegEncoder();
+            if (codec is null) return (null, false);
+
+            using var ms = new MemoryStream();
+            var ps = new System.Drawing.Imaging.EncoderParameters(1);
+            ps.Param[0] = new System.Drawing.Imaging.EncoderParameter(
+                System.Drawing.Imaging.Encoder.Quality, 85L);
+            bmp.Save(ms, codec, ps);
+            return (ms.ToArray(), true);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("图片压缩失败，改用原图：" + ex.Message);
+            return (null, false);
+        }
+    }
+
+    private static System.Drawing.Imaging.ImageCodecInfo? GetJpegEncoder()
+    {
+        foreach (var c in System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders())
+            if (c.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid)
+                return c;
+        return null;
     }
 
     private static string DetectMime(byte[] b)

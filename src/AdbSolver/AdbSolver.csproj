@@ -47,7 +47,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationDefaultFont>Microsoft YaHei UI, 9pt</ApplicationDefaultFont>
 
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <AssemblyTitle>AdbSolver - ADB 截图自动答题</AssemblyTitle>
     <Product>AdbSolver</Product>
     <Company>Seagull</Company>

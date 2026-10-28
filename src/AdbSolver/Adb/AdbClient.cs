@@ -10,9 +10,18 @@ namespace AdbSolver.Adb;
 public sealed class AdbClient
 {
     private readonly AdbConfig _cfg;
+    private readonly StealthConfig? _stealth;
     private string? _adbPath;
 
-    public AdbClient(AdbConfig cfg) => _cfg = cfg;
+    public AdbClient(AdbConfig cfg, StealthConfig? stealth = null)
+    {
+        _cfg = cfg;
+        _stealth = stealth;
+    }
+
+    /// <summary>反检测是否真正生效（开关打开 + 内存直出打开）。</summary>
+    private bool StealthCapture =>
+        _stealth is { Enabled: true, CaptureInMemory: true };
 
     public string AdbPath => _adbPath ??= ResolveAdbPath();
 
@@ -382,7 +391,31 @@ public sealed class AdbClient
     /// <summary>把设备截图拉到本地文件。成功返回 true。</summary>
     public async Task<bool> PullScreenshotAsync(string serial, string localPath, CancellationToken ct = default)
     {
-        var remote = "/sdcard/adbsolver_cap.png";
+        // 反检测路径：exec-out 直接把 PNG 吐到内存，设备上不留任何文件。
+        if (StealthCapture)
+        {
+            var (data, err) = await CaptureToMemoryAsync(serial, ct).ConfigureAwait(false);
+            if (data is null)
+            {
+                Log.Warn($"exec-out 截图失败: {err}");
+                return false;
+            }
+
+            try
+            {
+                var dir = Path.GetDirectoryName(localPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                await File.WriteAllBytesAsync(localPath, data, ct).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("写入截图失败", ex);
+                return false;
+            }
+        }
+
+        var remote = RemoteTempPath("png");
 
         // screencap -p 直接写远端文件
         var cap = await RunAsync(new[] { "shell", "screencap", "-p", remote }, serial, ct, 15000)
@@ -396,6 +429,102 @@ public sealed class AdbClient
         var ok = await PullRemoteFileAsync(serial, remote, localPath, ct).ConfigureAwait(false);
         _ = CleanupRemoteAsync(serial, CancellationToken.None);
         return ok;
+    }
+
+    /// <summary>
+    /// 反检测核心：<c>adb exec-out screencap -p</c> 直接把 PNG 字节流读进内存。
+    ///
+    /// 为什么这个比老办法干净得多：
+    ///   • 老办法先 screencap 写到 /sdcard/xxx.png 再 pull —— /sdcard 是全设备共享存储，
+    ///     任何拿到存储权限的 App 都能 ls 出来看文件名、看修改时间。就算事后删，
+    ///     在这几百毫秒的窗口里、或者进程被强杀之后，痕迹就留在那儿了。
+    ///   • exec-out 是 shell 里跑 screencap 然后字节流直接通过 USB 回来，
+    ///     **中间不落盘**，设备上从头到尾没有这个文件。
+    ///
+    /// 返回值 Data 为 null 表示失败，此时 err 有原因。
+    /// </summary>
+    public async Task<(byte[]? Data, string Err)> CaptureToMemoryAsync(
+        string serial, CancellationToken ct = default)
+    {
+        var full = new List<string>();
+        var target = string.IsNullOrWhiteSpace(serial) ? _cfg.DeviceSerial : serial;
+        if (!string.IsNullOrWhiteSpace(target))
+        {
+            full.Add("-s");
+            full.Add(target.Trim());
+        }
+        full.Add("exec-out");
+        full.Add("screencap");
+        full.Add("-p");
+
+        var (data, err, timedOut) = await ProcRunner.RunBytesAsync(
+            AdbPath, full, TimeSpan.FromSeconds(20), ct, null, ChildEnv).ConfigureAwait(false);
+
+        if (timedOut)
+        {
+            Log.Warn("exec-out 截图超时");
+            return (null, "超时" + (err.Length > 0 ? ": " + err : ""));
+        }
+
+        if (data is null || data.Length == 0)
+            return (null, err.Length > 0 ? err : "无输出");
+
+        // 校验 PNG 魔数。某些老设备 exec-out 会混入 CRLF 转换（Windows 端 adb 的老毛病），
+        // 那种数据前面带 \r\n，PNG 头就不在 0 位置，这里顺手修掉。
+        data = StripCrlfPreamble(data);
+
+        if (data.Length < 8 || !IsPngHeader(data))
+        {
+            // 不是 PNG：大概率是设备把 screencap 的报错当 stdout 吐回来了
+            var preview = SafePreview(data);
+            Log.Warn($"exec-out 返回的不是 PNG（{data.Length} 字节）: {preview}");
+            return (null, $"{data.Length} 字节且非 PNG: {preview}");
+        }
+
+        return (data, "");
+    }
+
+    private static bool IsPngHeader(byte[] b) =>
+        b.Length >= 8 &&
+        b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 &&
+        b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A;
+
+    /// <summary>老 adb 在 Windows 上会把 \n 转成 \r\n，包头前多出 CRLF，剥掉。</summary>
+    private static byte[] StripCrlfPreamble(byte[] data)
+    {
+        var i = 0;
+        while (i + 1 < data.Length && data[i] == 0x0D && data[i + 1] == 0x0A) i += 2;
+        if (i == 0) return data;
+        var outBuf = new byte[data.Length - i];
+        Buffer.BlockCopy(data, i, outBuf, 0, outBuf.Length);
+        return outBuf;
+    }
+
+    private static string SafePreview(byte[] data)
+    {
+        try
+        {
+            var n = Math.Min(120, data.Length);
+            var s = System.Text.Encoding.UTF8.GetString(data, 0, n);
+            return s.Replace('\r', ' ').Replace('\n', ' ');
+        }
+        catch { return "(无法显示)"; }
+    }
+
+    /// <summary>生成远端临时文件路径。反检测开启时用随机名。</summary>
+    private string RemoteTempPath(string ext)
+    {
+        // 随机名统一带 .adbsc_ 前缀且以点开头（Linux 下 = 隐藏文件，ls 默认不显示），
+        // 这样 CleanupRemoteAsync 能用通配符一把清干净。
+        var name = _stealth is { Enabled: true, RandomizeTempNames: true }
+            ? $".adbsc_{Guid.NewGuid():N}.{ext}"
+            : $"adbsolver_cap.{ext}";
+
+        var dir = _stealth is { Enabled: true } && !string.IsNullOrWhiteSpace(_stealth.RemoteTempDir)
+            ? _stealth.RemoteTempDir
+            : "/sdcard";
+
+        return $"{dir.TrimEnd('/')}/{name}";
     }
 
     /// <summary>
@@ -437,13 +566,32 @@ public sealed class AdbClient
         }
     }
 
-    /// <summary>删除设备上的临时截图。</summary>
-    public async Task CleanupRemoteAsync(string serial, CancellationToken ct = default)
+    /// <summary>
+    /// 删除设备上的临时截图。
+    ///
+    /// 反检测开启后文件名是随机的，没法按名字删了 —— 所以改成按模式清：
+    /// 把我们可能留下的两种命名（老的固定名 + 新的随机名）都扫一遍删掉。
+    /// 用 shell 通配符一次搞定，比逐个 rm 少几条命令，更快也更不显眼。
+    /// </summary>
+    public async Task CleanupRemoteAsync(string serial, CancellationToken ct = default, string? remotePath = null)
     {
+        var dir = _stealth is { Enabled: true } && !string.IsNullOrWhiteSpace(_stealth.RemoteTempDir)
+            ? _stealth.RemoteTempDir.TrimEnd('/')
+            : "/sdcard";
+
         try
         {
-            await RunAsync(new[] { "shell", "rm", "-f", "/sdcard/adbsolver_cap.png" }, serial, ct, 6000)
-                .ConfigureAwait(false);
+            // 指定了具体文件就只删那个
+            if (!string.IsNullOrWhiteSpace(remotePath))
+            {
+                await RunAsync(new[] { "shell", "rm", "-f", remotePath }, serial, ct, 6000)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            // 否则按模式清理。两条 rm 用一个 shell 串起来，少一次进程往返。
+            var script = $"rm -f {dir}/adbsolver_cap.png {dir}/.adbsc_*.png {dir}/adbsolver_cap.jpg {dir}/.adbsc_*.jpg 2>/dev/null; true";
+            await RunAsync(new[] { "shell", script }, serial, ct, 6000).ConfigureAwait(false);
         }
         catch { }
     }

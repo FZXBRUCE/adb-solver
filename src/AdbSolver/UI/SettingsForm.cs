@@ -14,12 +14,19 @@ public sealed class SettingsForm : Form
     private readonly NumericUpDown _numPoll = new();
     private readonly NumericUpDown _numSettle = new();
     private readonly CheckBox _chkKeep = new();
-    private readonly CheckBox _chkSearch = new();
     private readonly CheckBox _chkClipboard = new();
     private readonly NumericUpDown _numMinChars = new();
     private readonly NumericUpDown _numMaxFail = new();
     private readonly TextBox _txtStyle = new();
     private readonly Label _lblEndpointCount = new();
+
+    private readonly CheckBox _chkStealth = new();
+    private readonly CheckBox _chkStealthMemory = new();
+    private readonly CheckBox _chkStealthRandom = new();
+    private readonly TextBox _txtStealthDir = new();
+    private readonly NumericUpDown _numStealthJitter = new();
+    private readonly CheckBox _chkStealthTitle = new();
+    private readonly TextBox _txtStealthTitle = new();
 
     public SettingsForm(AppConfig cfg, AdbClient? adb)
     {
@@ -87,22 +94,22 @@ public sealed class SettingsForm : Form
         _cmbMode.DropDownStyle = ComboBoxStyle.DropDownList;
         _cmbMode.Items.AddRange(new object[]
         {
-            "标准（推荐，700ms）",
-            "灵敏（350ms，更跟手）",
+            "标准（250ms）",
+            "灵敏（150ms，更跟手）",
             "省电（1500ms，延迟更大）",
         });
         // 用轮询间隔反推当前档位
-        _cmbMode.SelectedIndex = cfg.Capture.PollIntervalMs <= 400 ? 1
+        _cmbMode.SelectedIndex = cfg.Capture.PollIntervalMs <= 200 ? 1
             : cfg.Capture.PollIntervalMs >= 1500 ? 2 : 0;
         _cmbMode.Dock = DockStyle.Left;
         _cmbMode.Width = 200;
         _cmbMode.SelectedIndexChanged += (_, _) =>
         {
-            var v = _cmbMode.SelectedIndex switch { 1 => 350, 2 => 1500, _ => 700 };
+            var v = _cmbMode.SelectedIndex switch { 1 => 150, 2 => 1500, _ => 250 };
             if ((int)_numPoll.Value != v) _numPoll.Value = v;
         };
 
-        _numPoll.Minimum = 200;
+        _numPoll.Minimum = 100;
         _numPoll.Maximum = 10000;
         _numPoll.Increment = 100;
         _numPoll.Value = cfg.Capture.PollIntervalMs;
@@ -112,7 +119,7 @@ public sealed class SettingsForm : Form
         {
             // 手动改了间隔，档位跟着联动
             var v = (int)_numPoll.Value;
-            _cmbMode.SelectedIndex = v <= 400 ? 1 : v >= 1500 ? 2 : 0;
+            _cmbMode.SelectedIndex = v <= 200 ? 1 : v >= 1500 ? 2 : 0;
         };
 
         _numSettle.Minimum = 0;
@@ -188,7 +195,7 @@ public sealed class SettingsForm : Form
                    "故障转移：按列表顺序尝试，第一个成功返回的胜出。\n" +
                    "角色分工：可让 A 端点专门识图、B 端点专门作答，留空则全部承担。\n\n" +
                    "识图（OCR）需要多模态模型，例如 gpt-4o / claude-sonnet / gemini-2.x / qwen-vl-max / glm-4v。\n" +
-                   "纯文本模型（deepseek-chat 等）请只勾选 Search 和 Solve。",
+                   "纯文本模型（deepseek-chat 等）可以专门承担 Solve。整条链路只有两个阶段：识图切题（需视觉）+ 作答（文本即可）。",
         };
 
         aiPanel.Controls.Add(aiInfo);
@@ -199,11 +206,6 @@ public sealed class SettingsForm : Form
         // ============ 流水线 ============
         var pPipe = new TabPage("答题流程") { Padding = new Padding(14) };
         var lPipe = NewTable();
-
-        _chkSearch.Text = "先检索再作答（两段式，更准但更慢/更贵）";
-        _chkSearch.Checked = cfg.Pipeline.EnableSearch;
-        _chkSearch.Dock = DockStyle.Left;
-        _chkSearch.Width = 340;
 
         _chkClipboard.Text = "答案自动复制到剪贴板";
         _chkClipboard.Checked = cfg.Pipeline.CopyAnswerToClipboard;
@@ -228,7 +230,6 @@ public sealed class SettingsForm : Form
         _txtStyle.Dock = DockStyle.Fill;
         _txtStyle.Height = 90;
 
-        AddRow(lPipe, "检索", _chkSearch, 24);
         AddRow(lPipe, "剪贴板", _chkClipboard, 24);
         AddRow(lPipe, "最短题干", _numMinChars, 26);
         AddRow(lPipe, "失败暂停阈值", _numMaxFail, 26);
@@ -236,10 +237,80 @@ public sealed class SettingsForm : Form
 
         pPipe.Controls.Add(lPipe);
 
+        // ============ 反检测 ============
+        var pStealth = new TabPage("反检测") { Padding = new Padding(14) };
+        var lStealth = NewTable();
+
+        _chkStealth.Text = "启用反检测（默认关闭）";
+        _chkStealth.Checked = cfg.Stealth.Enabled;
+        _chkStealth.Dock = DockStyle.Left;
+        _chkStealth.Width = 300;
+        _chkStealth.Font = new Font(Font, FontStyle.Bold);
+
+        _chkStealthMemory.Text = "截图走内存（设备上不留临时文件）";
+        _chkStealthMemory.Checked = cfg.Stealth.CaptureInMemory;
+        _chkStealthMemory.Dock = DockStyle.Left;
+        _chkStealthMemory.Width = 340;
+
+        _chkStealthRandom.Text = "临时文件名随机化";
+        _chkStealthRandom.Checked = cfg.Stealth.RandomizeTempNames;
+        _chkStealthRandom.Dock = DockStyle.Left;
+        _chkStealthRandom.Width = 340;
+
+        _txtStealthDir.Text = cfg.Stealth.RemoteTempDir;
+        _txtStealthDir.Dock = DockStyle.Fill;
+
+        _numStealthJitter.Minimum = 0;
+        _numStealthJitter.Maximum = 50;
+        _numStealthJitter.Increment = 5;
+        _numStealthJitter.Value = (decimal)Math.Clamp(cfg.Stealth.PollJitter * 100, 0, 50);
+        _numStealthJitter.Dock = DockStyle.Left;
+        _numStealthJitter.Width = 110;
+
+        _chkStealthTitle.Text = "窗口标题伪装成普通工具";
+        _chkStealthTitle.Checked = cfg.Stealth.DiscreetTitle;
+        _chkStealthTitle.Dock = DockStyle.Left;
+        _chkStealthTitle.Width = 340;
+
+        _txtStealthTitle.Text = cfg.Stealth.WindowTitle;
+        _txtStealthTitle.Dock = DockStyle.Fill;
+
+        AddRow(lStealth, "总开关", _chkStealth, 26);
+        AddRow(lStealth, "内存截图", _chkStealthMemory, 24);
+        AddRow(lStealth, "文件名随机", _chkStealthRandom, 24);
+        AddRow(lStealth, "临时目录", _txtStealthDir, 26);
+        AddRow(lStealth, "轮询抖动(%)", _numStealthJitter, 26);
+        AddRow(lStealth, "标题伪装", _chkStealthTitle, 24);
+        AddRow(lStealth, "自定义标题", _txtStealthTitle, 26);
+
+        var stealthInfo = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 132,
+            ForeColor = Color.DimGray,
+            Padding = new Padding(0, 12, 0, 0),
+            Text =
+                "默认关闭，关掉时行为和以前完全一致。\n" +
+                "\n" +
+                "开启后能做：\n" +
+                "  · exec-out 直接把 PNG 读到内存，设备上不落文件\n" +
+                "  · 必须落盘时用隐藏名 + 随机名，且放在 /data/local/tmp\n" +
+                "  · 轮询间隔加随机抖动，不再是精确节拍器\n" +
+                "  · 窗口标题换成不显眼的名字\n" +
+                "\n" +
+                "改不了的（这些在手机侧，PC 端无能为力）：\n" +
+                "  · 系统设置里的「USB 调试」开关状态\n" +
+                "  · 5037 端口是否在监听\n" +
+                "  · App 自己调 FLAG_SECURE 禁止截图",
+        };
+
+        pStealth.Controls.Add(stealthInfo);
+        pStealth.Controls.Add(lStealth);
         tabs.TabPages.Add(pAdb);
         tabs.TabPages.Add(pCap);
         tabs.TabPages.Add(pAi);
         tabs.TabPages.Add(pPipe);
+        tabs.TabPages.Add(pStealth);
 
         // ============ 底部 ============
         var bottom = new FlowLayoutPanel
@@ -305,20 +376,24 @@ public sealed class SettingsForm : Form
         _cfg.Adb.CommandTimeoutMs = (int)_numTimeout.Value;
 
         _cfg.Capture.Mode = CaptureMode.Hybrid;
-        _cfg.Capture.PollIntervalMs = _cmbMode.SelectedIndex switch
-        {
-            1 => 350,
-            2 => 1500,
-            _ => 700,
-        };
+        // 直接用数值框的值。以前这里按档位反推 350/1500/700，
+        // 用户手动填的 250 之类的值会被悄悄改掉，属于老坑。
+        _cfg.Capture.PollIntervalMs = (int)_numPoll.Value;
         _cfg.Capture.SettleDelayMs = (int)_numSettle.Value;
         _cfg.Capture.KeepImages = _chkKeep.Checked;
 
-        _cfg.Pipeline.EnableSearch = _chkSearch.Checked;
         _cfg.Pipeline.CopyAnswerToClipboard = _chkClipboard.Checked;
         _cfg.Pipeline.MinQuestionChars = (int)_numMinChars.Value;
         _cfg.Pipeline.MaxConsecutiveFailures = (int)_numMaxFail.Value;
         _cfg.Pipeline.AnswerStyle = _txtStyle.Text.Trim();
+
+        _cfg.Stealth.Enabled = _chkStealth.Checked;
+        _cfg.Stealth.CaptureInMemory = _chkStealthMemory.Checked;
+        _cfg.Stealth.RandomizeTempNames = _chkStealthRandom.Checked;
+        _cfg.Stealth.RemoteTempDir = _txtStealthDir.Text.Trim();
+        _cfg.Stealth.PollJitter = (double)_numStealthJitter.Value / 100.0;
+        _cfg.Stealth.DiscreetTitle = _chkStealthTitle.Checked;
+        _cfg.Stealth.WindowTitle = _txtStealthTitle.Text.Trim();
 
         _cfg.Normalize();
     }
